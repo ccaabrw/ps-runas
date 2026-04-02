@@ -18,6 +18,11 @@
     The script therefore always launches the PowerShell executable directly in a plain console
     window, regardless of whether wt.exe is installed.
 
+    Note: PowerShell 7 installed from the Microsoft Store is also an MSIX-packaged application
+    and shares the same restriction.  If the currently-running PowerShell host is Store-installed,
+    the script automatically falls back to a traditionally-installed PowerShell executable
+    (MSI-installed pwsh.exe, then Windows PowerShell 5.1).
+
 .PARAMETER UserName
     The domain-qualified user name to run as, e.g. "CONTOSO\jdoe" or "jdoe@contoso.com".
     When omitted, Get-Credential will prompt interactively.
@@ -59,6 +64,9 @@
     The target account must have permission to log on interactively on this machine.
     Windows Terminal (wt.exe) is not supported when running as a different user due to MSIX
     packaging restrictions; the session will always open in a plain PowerShell console window.
+    PowerShell 7 installed from the Microsoft Store is also MSIX-packaged and subject to the same
+    restriction; the script will automatically fall back to an MSI-installed pwsh.exe or
+    Windows PowerShell 5.1 in that case.
 #>
 
 [CmdletBinding(DefaultParameterSetName = 'ByUserName')]
@@ -116,6 +124,41 @@ if (-not (Test-Path -LiteralPath $psExe)) {
     $psExe = Join-Path $PSHOME (
         if ($IsCoreCLR) { 'pwsh.exe' } else { 'powershell.exe' }
     )
+}
+
+# CreateProcessWithLogonW (used internally by Start-Process -Credential) cannot
+# launch MSIX-packaged executables – this produces an "incorrect username or
+# password" error even with valid credentials.  PowerShell 7 can be installed
+# from the Microsoft Store as an MSIX package, so detect that case and fall back
+# to a traditionally-installed (MSI or in-box) PowerShell executable.
+$msixRoots = @(
+    [System.IO.Path]::Combine($env:ProgramFiles, 'WindowsApps'),
+    [System.IO.Path]::Combine($env:LOCALAPPDATA, 'Microsoft', 'WindowsApps')
+)
+
+if ($msixRoots | Where-Object { $psExe -like "$_\*" }) {
+    Write-Warning ("The running PowerShell host ('{0}') is an MSIX-packaged application " +
+                   "and cannot be started as a different user. Searching for a " +
+                   "traditionally-installed PowerShell executable...") -f $psExe
+
+    $candidateExes = @(
+        # PowerShell 7+ MSI install (default path used by all 7.x releases)
+        (Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'),
+        # Windows PowerShell is inbox and is never distributed as an MSIX package
+        (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe')
+    )
+
+    $fallbackExe = $candidateExes | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+
+    if (-not $fallbackExe) {
+        throw ("No traditionally-installed PowerShell executable was found. " +
+               "To run as a different user, please install PowerShell 7 via the MSI " +
+               "installer from https://github.com/PowerShell/PowerShell/releases " +
+               "instead of the Microsoft Store, or use Windows PowerShell 5.1.")
+    }
+
+    Write-Warning "Falling back to '$fallbackExe'."
+    $psExe = $fallbackExe
 }
 
 #endregion
