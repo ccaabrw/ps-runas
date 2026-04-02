@@ -258,6 +258,11 @@ try {
     ) | Where-Object { (Test-Path -LiteralPath $_) -and ($_ -ne $initialExe) }
 
     $launched = $false
+    # Capture the most recent logon-failure exception so it can be included in
+    # the final error message when all candidates are exhausted.  Initialized to
+    # the failure of the initial executable as a fallback for the (unlikely) case
+    # where $retryExes is empty.
+    $lastCaughtError = $_
     foreach ($retryExe in $retryExes) {
         try {
             Write-Warning ("Could not start '$initialExe' as a different user " +
@@ -275,14 +280,24 @@ try {
             $isRetryLogonFailure = ($retryWin32Ex -and $retryWin32Ex.NativeErrorCode -eq 1326) -or
                                    ($_.Exception.Message -like '*user name or password*')
             if (-not $isRetryLogonFailure) { throw }
+            $lastCaughtError = $_
             # Logon failure on this candidate; try the next one.
         }
     }
 
     if (-not $launched) {
         $attempted = (@($initialExe) + @($retryExes)) -join "', '"
+        # Surface the underlying Win32 error so the user can diagnose the real
+        # cause (e.g. wrong password, account locked, domain unreachable, missing
+        # interactive logon right) rather than seeing only the generic message.
+        $lcWin32 = $lastCaughtError.Exception.InnerException -as [System.ComponentModel.Win32Exception]
+        $errDetail = if ($lcWin32) {
+            " The underlying error was: $($lcWin32.Message) (Win32 error $($lcWin32.NativeErrorCode))."
+        } else {
+            " The underlying error was: $($lastCaughtError.Exception.Message)."
+        }
         throw ("Could not start a PowerShell session as '$($Credential.UserName)'. " +
-               "All candidate executables failed: '$attempted'. " +
+               "All candidate executables failed: '$attempted'.$errDetail " +
                "Verify that the credentials are correct and that the account has " +
                "permission to log on interactively on this machine.")
     }
