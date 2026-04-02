@@ -267,7 +267,15 @@ try {
             $launched = $true
             break
         } catch {
-            # Try the next candidate.
+            # Only suppress logon-failure errors (Win32 1326), which may indicate
+            # that this candidate is also MSIX-packaged.  Any other error is real
+            # (e.g. wrong credentials, logon type not permitted) and should be
+            # surfaced immediately rather than silently discarded.
+            $retryWin32Ex = $_.Exception.InnerException -as [System.ComponentModel.Win32Exception]
+            $isRetryLogonFailure = ($retryWin32Ex -and $retryWin32Ex.NativeErrorCode -eq 1326) -or
+                                   ($_.Exception.Message -like '*user name or password*')
+            if (-not $isRetryLogonFailure) { throw }
+            # Logon failure on this candidate; try the next one.
         }
     }
 
