@@ -41,19 +41,13 @@ ps-runas/
 .\Start-RunAs.ps1 -UserName "CONTOSO\AdminUser"
 ```
 
-You will be prompted for the password.  A new Windows Terminal window (or tab with `-NoNewWindow`) opens running PowerShell as `CONTOSO\AdminUser`.
+You will be prompted for the password.  A new PowerShell console window opens running as `CONTOSO\AdminUser`.
 
 ### Pass a pre-built credential
 
 ```powershell
 $cred = Get-Credential -UserName "CONTOSO\AdminUser" -Message "Enter admin credentials"
 .\Start-RunAs.ps1 -Credential $cred
-```
-
-### Open in a new tab instead of a new window
-
-```powershell
-.\Start-RunAs.ps1 -UserName "CONTOSO\AdminUser" -NoNewWindow
 ```
 
 ### Start in a specific directory
@@ -71,7 +65,7 @@ $cred = Get-Credential -UserName "CONTOSO\AdminUser" -Message "Enter admin crede
 | `-UserName` | `string` | Domain-qualified user name, e.g. `CONTOSO\jdoe` or `jdoe@contoso.com`. Triggers an interactive password prompt. |
 | `-Credential` | `PSCredential` | Pre-built credential object. Mutually exclusive with `-UserName`. |
 | `-WorkingDirectory` | `string` | Starting directory for the new session. Defaults to the current directory. |
-| `-NoNewWindow` | `switch` | Open as a new tab in the current Windows Terminal window instead of a new window. |
+| `-NoNewWindow` | `switch` | Accepted for backwards compatibility; has no effect (Windows Terminal cannot be launched as a different user). |
 | `-ArgumentList` | `string[]` | Extra arguments forwarded to the PowerShell executable inside the new session. |
 
 ---
@@ -111,7 +105,8 @@ The window remains open (`-NoExit`) so you can continue running AD commands inte
 `Start-RunAs.ps1` calls [`Start-Process`](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.management/start-process) with the `-Credential` parameter, which uses the Windows `CreateProcessWithLogonW` API under the hood.  This is exactly what *Run as different user* does.
 
 ```
-Start-Process wt.exe -Credential $cred -ArgumentList "new-tab -- pwsh.exe -NoExit ..."
+Start-Process pwsh.exe -Credential $cred -ArgumentList "-NoExit ..."
 ```
 
-When `wt.exe` is not on the `PATH`, the script falls back to launching `powershell.exe` / `pwsh.exe` directly in its own console window.
+**Why not Windows Terminal (`wt.exe`)?**  
+`wt.exe` is distributed as an MSIX-packaged application.  `CreateProcessWithLogonW` cannot launch packaged apps — attempting to do so always fails with an "incorrect username or password" error, even when the credentials are correct.  The script therefore always launches the PowerShell executable directly in a new console window.
