@@ -27,6 +27,16 @@
     DNS name of the Active Directory domain (used only inside the example
     queries).  Defaults to the domain of the current machine.
 
+.PARAMETER NetOnly
+    Passes the -NetOnly switch through to Start-RunAs.ps1, which causes
+    the new PowerShell window to run locally under your own account while
+    routing all network access (LDAP, UNC paths, etc.) through the specified
+    domain admin credentials.
+
+    Use this when the target account does not have the "Log on locally"
+    (interactive logon) user right on this machine — which is common for
+    privileged domain admin accounts in many organisations.
+
 .EXAMPLE
     .\examples\Invoke-ADManagement.ps1 -DomainAdmin "CONTOSO\ADAdmin"
 
@@ -38,6 +48,13 @@
 
     Same as above but targets the contoso.com domain explicitly.
 
+.EXAMPLE
+    .\examples\Invoke-ADManagement.ps1 -DomainAdmin "CONTOSO\ADAdmin" -NetOnly
+
+    Use when the domain admin account does not have interactive logon rights on
+    this machine.  The new window runs locally as your own account but all AD
+    queries and network access use the specified credentials.
+
 .NOTES
     Prerequisites:
       • RSAT: Active Directory Domain Services and Lightweight Directory
@@ -46,6 +63,8 @@
             Add-WindowsCapability -Online -Name Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0
       • The Start-RunAs.ps1 script must exist in the parent directory
         (..\ relative to this file).
+      • -NetOnly does not require the target account to have interactive logon
+        rights on this machine; it is equivalent to "runas /netonly".
 #>
 
 [CmdletBinding()]
@@ -54,7 +73,10 @@ param (
     [string] $DomainAdmin,
 
     [Parameter()]
-    [string] $Domain = $env:USERDNSDOMAIN
+    [string] $Domain = $env:USERDNSDOMAIN,
+
+    [Parameter()]
+    [switch] $NetOnly
 )
 
 Set-StrictMode -Version Latest
@@ -127,12 +149,14 @@ $tempScript = [System.IO.Path]::GetTempFileName() -replace '\.tmp$', '.ps1'
 try {
     $adScript | Set-Content -LiteralPath $tempScript -Encoding UTF8
 
-    Write-Host "Opening Windows Terminal as '$DomainAdmin' for AD management..." `
+    $netOnlySuffix = if ($NetOnly) { ' (NetOnly - network credentials only)' } else { '' }
+    Write-Host "Opening Windows Terminal as '$DomainAdmin' for AD management$netOnlySuffix..." `
                -ForegroundColor Cyan
 
     & $startRunAs `
         -Credential      $credential `
         -ArgumentList    @('-File', $tempScript) `
+        -NetOnly:$NetOnly `
         -Verbose:($VerbosePreference -eq 'Continue')
 }
 finally {
