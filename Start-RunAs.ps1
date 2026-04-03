@@ -42,6 +42,18 @@
 .PARAMETER ArgumentList
     Additional arguments forwarded verbatim to the PowerShell executable inside the new session.
 
+.PARAMETER NetOnly
+    Uses the LOGON_NETONLY logon flag (equivalent to "runas /netonly").
+
+    When this switch is specified the new PowerShell window runs locally under your own
+    account's token, but any network access (LDAP/Active Directory queries, UNC paths,
+    etc.) performed inside that window will use the credentials you provided.
+
+    Use this switch when the target account does not have the "Log on locally"
+    (interactive logon) user right on this machine — which is common for privileged
+    domain admin accounts in many organisations.  The standard Start-Process -Credential
+    path requires that right; -NetOnly does not.
+
 .EXAMPLE
     .\Start-RunAs.ps1 -UserName "CONTOSO\AdminUser"
 
@@ -62,7 +74,8 @@
 
 .NOTES
     Requires Windows PowerShell 5.1 or PowerShell 7+.
-    The target account must have permission to log on interactively on this machine.
+    The target account must have permission to log on interactively on this machine, unless
+    the -NetOnly switch is used (see -NetOnly for details).
     Windows Terminal (wt.exe) is not supported when running as a different user due to MSIX
     packaging restrictions; the session will always open in a plain PowerShell console window.
     PowerShell 7 installed from the Microsoft Store is also MSIX-packaged and subject to the same
@@ -70,6 +83,7 @@
     Windows PowerShell 5.1 in that case.  If Start-Process still fails with an "incorrect
     username or password" error (e.g. because the OS reported a non-standard image path for the
     MSIX process), the script will automatically retry with the non-MSIX fallback executables.
+    If all retries fail and the credentials are known to be correct, re-run with -NetOnly.
 #>
 
 [CmdletBinding(DefaultParameterSetName = 'ByUserName')]
@@ -87,6 +101,9 @@ param (
 
     [Parameter()]
     [switch] $NoNewWindow,
+
+    [Parameter()]
+    [switch] $NetOnly,
 
     [Parameter()]
     [string[]] $ArgumentList
@@ -226,80 +243,197 @@ if ($wtExe) {
     Write-Warning "Windows Terminal (wt.exe) cannot be started as a different user because it is an MSIX-packaged application. Falling back to a plain PowerShell window."
 }
 
-$startParams = @{
-    FilePath            = $psExe
-    ArgumentList        = $innerArgs
-    Credential          = $Credential
-    WorkingDirectory    = $WorkingDirectory
-    ErrorAction         = 'Stop'
-}
-
 Write-Host "Starting PowerShell session as '$($Credential.UserName)'..." -ForegroundColor Cyan
 
-try {
-    Start-Process @startParams
-} catch {
-    # If the error is ERROR_LOGON_FAILURE (Win32 error 1326) the executable may
-    # be an MSIX-packaged application that was not caught by the earlier detection
-    # step (e.g. the OS reported a virtualized image path).  Retry with the known
-    # non-MSIX PowerShell executables before surfacing the error to the user.
-    # Check via the Win32 error code first (locale-independent), then fall back
-    # to a message-string match for robustness across PowerShell versions.
-    $win32Ex = $_.Exception.InnerException -as [System.ComponentModel.Win32Exception]
-    $isLogonFailure = ($win32Ex -and $win32Ex.NativeErrorCode -eq 1326) -or
-                      ($_.Exception.Message -like '*user name or password*')
+if ($NetOnly) {
+    # -NetOnly mode: call CreateProcessWithLogonW directly with LOGON_NETONLY.
+    # This is equivalent to "runas /netonly": the spawned process runs locally
+    # under the current user's token, but any network access (LDAP, UNC paths,
+    # etc.) uses the specified credentials.  No interactive logon right is
+    # required for the target account on this machine.
+    if (-not ('PsRunAsInternal.Win32' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
 
-    if (-not $isLogonFailure) { throw }
+namespace PsRunAsInternal {
+    public static class Win32 {
+        public const uint LOGON_NETONLY     = 2;
+        public const uint CREATE_NEW_CONSOLE = 0x00000010;
 
-    $initialExe = $startParams['FilePath']
-    $retryExes = @(
-        (Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'),
-        (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe')
-    ) | Where-Object { (Test-Path -LiteralPath $_) -and ($_ -ne $initialExe) }
-
-    $launched = $false
-    # Capture the most recent logon-failure exception so it can be included in
-    # the final error message when all candidates are exhausted.  Initialized to
-    # the failure of the initial executable as a fallback for the (unlikely) case
-    # where $retryExes is empty.
-    $lastCaughtError = $_
-    foreach ($retryExe in $retryExes) {
-        try {
-            Write-Warning ("Could not start '$initialExe' as a different user " +
-                           "(the executable may be MSIX-packaged). Retrying with '$retryExe'...")
-            $startParams['FilePath'] = $retryExe
-            Start-Process @startParams
-            $launched = $true
-            break
-        } catch {
-            # Only suppress logon-failure errors (Win32 1326), which may indicate
-            # that this candidate is also MSIX-packaged.  Any other error is real
-            # (e.g. wrong credentials, logon type not permitted) and should be
-            # surfaced immediately rather than silently discarded.
-            $retryWin32Ex = $_.Exception.InnerException -as [System.ComponentModel.Win32Exception]
-            $isRetryLogonFailure = ($retryWin32Ex -and $retryWin32Ex.NativeErrorCode -eq 1326) -or
-                                   ($_.Exception.Message -like '*user name or password*')
-            if (-not $isRetryLogonFailure) { throw }
-            $lastCaughtError = $_
-            # Logon failure on this candidate; try the next one.
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct STARTUPINFO {
+            public int    cb;
+            public IntPtr lpReserved;
+            public IntPtr lpDesktop;
+            public IntPtr lpTitle;
+            public int    dwX, dwY, dwXSize, dwYSize;
+            public int    dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
+            public short  wShowWindow, cbReserved2;
+            public IntPtr lpReserved2, hStdInput, hStdOutput, hStdError;
         }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct PROCESS_INFORMATION {
+            public IntPtr hProcess, hThread;
+            public int    dwProcessId, dwThreadId;
+        }
+
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        public static extern bool CreateProcessWithLogonW(
+            string lpUsername,
+            string lpDomain,
+            IntPtr lpPassword,
+            uint   dwLogonFlags,
+            string lpApplicationName,
+            string lpCommandLine,
+            uint   dwCreationFlags,
+            IntPtr lpEnvironment,
+            string lpCurrentDirectory,
+            ref STARTUPINFO       lpStartupInfo,
+            out PROCESS_INFORMATION lpProcessInformation);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool CloseHandle(IntPtr hObject);
+    }
+}
+'@
     }
 
-    if (-not $launched) {
-        $attempted = (@($initialExe) + @($retryExes)) -join "', '"
-        # Surface the underlying Win32 error so the user can diagnose the real
-        # cause (e.g. wrong password, account locked, domain unreachable, missing
-        # interactive logon right) rather than seeing only the generic message.
-        $lcWin32 = $lastCaughtError.Exception.InnerException -as [System.ComponentModel.Win32Exception]
-        $errDetail = if ($lcWin32) {
-            " The underlying error was: $($lcWin32.Message) (Win32 error $($lcWin32.NativeErrorCode))."
-        } else {
-            " The underlying error was: $($lastCaughtError.Exception.Message)."
+    # Split the credential username into the parts expected by
+    # CreateProcessWithLogonW.  For UPN format (user@domain) pass the full
+    # UPN as lpUsername with a null lpDomain, as documented by the API.
+    # For DOMAIN\user format split into the two components.
+    $credUser   = $Credential.UserName
+    $credDomain = $null
+    if ($credUser -match '^([^\\]+)\\(.+)$') {
+        $credDomain = $Matches[1]
+        $credUser   = $Matches[2]
+    }
+
+    # Build a properly-quoted command line string for lpCommandLine.
+    $quotedExe = '"' + $psExe.Replace('"', '""') + '"'
+    if ($innerArgs) {
+        $quotedArgs = $innerArgs | ForEach-Object { '"' + $_.Replace('"', '""') + '"' }
+        $cmdLine = $quotedExe + ' ' + ($quotedArgs -join ' ')
+    } else {
+        $cmdLine = $quotedExe
+    }
+
+    # Keep the plaintext password in memory as briefly as possible.
+    $passwordPtr = [System.Runtime.InteropServices.Marshal]::SecureStringToGlobalAllocUnicode(
+                       $Credential.Password)
+    try {
+        $si    = New-Object PsRunAsInternal.Win32+STARTUPINFO
+        $si.cb = [System.Runtime.InteropServices.Marshal]::SizeOf($si)
+        $pi    = New-Object PsRunAsInternal.Win32+PROCESS_INFORMATION
+
+        $ok = [PsRunAsInternal.Win32]::CreateProcessWithLogonW(
+            $credUser, $credDomain, $passwordPtr,
+            [PsRunAsInternal.Win32]::LOGON_NETONLY,
+            $psExe, $cmdLine,
+            [PsRunAsInternal.Win32]::CREATE_NEW_CONSOLE,
+            [IntPtr]::Zero,
+            $WorkingDirectory,
+            [ref]$si,
+            [ref]$pi)
+
+        if (-not $ok) {
+            $errCode  = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            $win32err = [System.ComponentModel.Win32Exception]::new($errCode)
+            throw ("Could not start a PowerShell session as '$($Credential.UserName)' " +
+                   "with -NetOnly. The underlying error was: $($win32err.Message) " +
+                   "(Win32 error $errCode). Verify that the credentials are correct.")
         }
-        throw ("Could not start a PowerShell session as '$($Credential.UserName)'. " +
-               "All candidate executables failed: '$attempted'.$errDetail " +
-               "Verify that the credentials are correct and that the account has " +
-               "permission to log on interactively on this machine.")
+
+        # We don't need to track the child process; close the handles.
+        if ($pi.hProcess -ne [IntPtr]::Zero) {
+            [PsRunAsInternal.Win32]::CloseHandle($pi.hProcess) | Out-Null
+        }
+        if ($pi.hThread -ne [IntPtr]::Zero) {
+            [PsRunAsInternal.Win32]::CloseHandle($pi.hThread) | Out-Null
+        }
+    } finally {
+        # Zero and free the plaintext password regardless of success or failure.
+        [System.Runtime.InteropServices.Marshal]::ZeroFreeGlobalAllocUnicode($passwordPtr)
+    }
+} else {
+    $startParams = @{
+        FilePath            = $psExe
+        ArgumentList        = $innerArgs
+        Credential          = $Credential
+        WorkingDirectory    = $WorkingDirectory
+        ErrorAction         = 'Stop'
+    }
+
+    try {
+        Start-Process @startParams
+    } catch {
+        # If the error is ERROR_LOGON_FAILURE (Win32 error 1326) the executable may
+        # be an MSIX-packaged application that was not caught by the earlier detection
+        # step (e.g. the OS reported a virtualized image path).  Retry with the known
+        # non-MSIX PowerShell executables before surfacing the error to the user.
+        # Check via the Win32 error code first (locale-independent), then fall back
+        # to a message-string match for robustness across PowerShell versions.
+        $win32Ex = $_.Exception.InnerException -as [System.ComponentModel.Win32Exception]
+        $isLogonFailure = ($win32Ex -and $win32Ex.NativeErrorCode -eq 1326) -or
+                          ($_.Exception.Message -like '*user name or password*')
+
+        if (-not $isLogonFailure) { throw }
+
+        $initialExe = $startParams['FilePath']
+        $retryExes = @(
+            (Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'),
+            (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe')
+        ) | Where-Object { (Test-Path -LiteralPath $_) -and ($_ -ne $initialExe) }
+
+        $launched = $false
+        # Capture the most recent logon-failure exception so it can be included in
+        # the final error message when all candidates are exhausted.  Initialized to
+        # the failure of the initial executable as a fallback for the (unlikely) case
+        # where $retryExes is empty.
+        $lastCaughtError = $_
+        foreach ($retryExe in $retryExes) {
+            try {
+                Write-Warning ("Could not start '$initialExe' as a different user " +
+                               "(the executable may be MSIX-packaged). Retrying with '$retryExe'...")
+                $startParams['FilePath'] = $retryExe
+                Start-Process @startParams
+                $launched = $true
+                break
+            } catch {
+                # Only suppress logon-failure errors (Win32 1326), which may indicate
+                # that this candidate is also MSIX-packaged.  Any other error is real
+                # (e.g. wrong credentials, logon type not permitted) and should be
+                # surfaced immediately rather than silently discarded.
+                $retryWin32Ex = $_.Exception.InnerException -as [System.ComponentModel.Win32Exception]
+                $isRetryLogonFailure = ($retryWin32Ex -and $retryWin32Ex.NativeErrorCode -eq 1326) -or
+                                       ($_.Exception.Message -like '*user name or password*')
+                if (-not $isRetryLogonFailure) { throw }
+                $lastCaughtError = $_
+                # Logon failure on this candidate; try the next one.
+            }
+        }
+
+        if (-not $launched) {
+            $attempted = (@($initialExe) + @($retryExes)) -join "', '"
+            # Surface the underlying Win32 error so the user can diagnose the real
+            # cause (e.g. wrong password, account locked, domain unreachable, missing
+            # interactive logon right) rather than seeing only the generic message.
+            $lcWin32 = $lastCaughtError.Exception.InnerException -as [System.ComponentModel.Win32Exception]
+            $errDetail = if ($lcWin32) {
+                " The underlying error was: $($lcWin32.Message) (Win32 error $($lcWin32.NativeErrorCode))."
+            } else {
+                " The underlying error was: $($lastCaughtError.Exception.Message)."
+            }
+            throw ("Could not start a PowerShell session as '$($Credential.UserName)'. " +
+                   "All candidate executables failed: '$attempted'.$errDetail " +
+                   "Verify that the credentials are correct and that the account has " +
+                   "permission to log on interactively on this machine. " +
+                   "If the credentials are correct but the account lacks interactive logon " +
+                   "rights on this machine, re-run with the -NetOnly switch.")
+        }
     }
 }
 

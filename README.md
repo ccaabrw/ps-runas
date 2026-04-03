@@ -18,7 +18,7 @@ When you need to perform tasks (e.g. Active Directory management) that require a
 | Windows 10 / Windows Server 2016 or later | Required for `wt.exe` support |
 | [Windows Terminal](https://aka.ms/terminal) | Falls back to a plain `powershell.exe` window if not found |
 | Windows PowerShell 5.1 **or** PowerShell 7+ | Both are supported |
-| Target account must be able to log on interactively | Standard domain account requirement |
+| Target account must be able to log on interactively | Only required without `-NetOnly`; use `-NetOnly` if the account lacks this right |
 
 ---
 
@@ -56,6 +56,15 @@ $cred = Get-Credential -UserName "CONTOSO\AdminUser" -Message "Enter admin crede
 .\Start-RunAs.ps1 -UserName "CONTOSO\AdminUser" -WorkingDirectory "C:\AdminTools"
 ```
 
+### Use NetOnly when the account lacks interactive logon rights
+
+```powershell
+.\Start-RunAs.ps1 -UserName "jdoe@contoso.com" -NetOnly
+```
+
+The new window runs locally as your own account but all network access (Active Directory,
+UNC paths, etc.) uses the specified credentials — identical to `runas /netonly`.
+
 ---
 
 ## Parameters
@@ -66,6 +75,7 @@ $cred = Get-Credential -UserName "CONTOSO\AdminUser" -Message "Enter admin crede
 | `-Credential` | `PSCredential` | Pre-built credential object. Mutually exclusive with `-UserName`. |
 | `-WorkingDirectory` | `string` | Starting directory for the new session. Defaults to the current directory. |
 | `-NoNewWindow` | `switch` | Accepted for backwards compatibility; has no effect (Windows Terminal cannot be launched as a different user). |
+| `-NetOnly` | `switch` | Uses `LOGON_NETONLY` (equivalent to `runas /netonly`). The new PowerShell window runs under your own local account but uses the supplied credentials for all network access (AD, UNC paths, etc.). Use this when the target account does not have interactive logon rights on this machine. |
 | `-ArgumentList` | `string[]` | Extra arguments forwarded to the PowerShell executable inside the new session. |
 
 ---
