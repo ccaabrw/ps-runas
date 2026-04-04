@@ -26,7 +26,10 @@ When you need to perform tasks (e.g. Active Directory management) that require a
 
 ```
 ps-runas/
-├── Start-RunAs.ps1                  # Main script
+├── Start-RunAs.ps1                  # Main script — start a session as a different user
+├── Save-Credential.ps1              # Save a credential to disk (DPAPI-encrypted SecureString)
+├── Get-SavedCredential.ps1          # Retrieve a previously saved credential
+├── Remove-SavedCredential.ps1       # Delete a saved credential from disk
 └── examples/
     └── Invoke-ADManagement.ps1      # Example: AD management session
 ```
@@ -120,3 +123,53 @@ Start-Process pwsh.exe -Credential $cred -ArgumentList "-NoExit ..."
 
 **Why not Windows Terminal (`wt.exe`)?**  
 `wt.exe` is distributed as an MSIX-packaged application.  `CreateProcessWithLogonW` cannot launch packaged apps — attempting to do so always fails with an "incorrect username or password" error, even when the credentials are correct.  The script therefore always launches the PowerShell executable directly in a new console window.
+
+---
+
+## Credential management
+
+The three credential scripts let you save and reuse credentials without being prompted every time.
+
+### Save a credential
+
+```powershell
+.\Save-Credential.ps1 -Name "CONTOSO-Admin" -UserName "CONTOSO\AdminUser"
+```
+
+You are prompted for the password once.  The credential is written to  
+`%APPDATA%\ps-cred\CONTOSO-Admin.cred` with the password encrypted by the Windows  
+Data Protection API (DPAPI) — only the same Windows user on the same machine can decrypt it.
+
+```powershell
+# Save a pre-built credential without a second prompt
+$cred = Get-Credential -UserName "CONTOSO\AdminUser" -Message "Enter admin credentials"
+.\Save-Credential.ps1 -Name "CONTOSO-Admin" -Credential $cred
+```
+
+### Retrieve a saved credential
+
+```powershell
+$cred = .\Get-SavedCredential.ps1 -Name "CONTOSO-Admin"
+.\Start-RunAs.ps1 -Credential $cred
+```
+
+`Get-SavedCredential.ps1` decrypts the stored password and returns a `PSCredential` object  
+that can be passed directly to `Start-RunAs.ps1` or any other cmdlet that accepts `-Credential`.
+
+### Remove a saved credential
+
+```powershell
+.\Remove-SavedCredential.ps1 -Name "CONTOSO-Admin"
+
+# Preview without deleting
+.\Remove-SavedCredential.ps1 -Name "CONTOSO-Admin" -WhatIf
+```
+
+### Credential store parameters
+
+All three scripts share the same `-Name` and `-StorePath` parameters.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `-Name` | *(required)* | Short label used as the file name (e.g. `"CONTOSO-Admin"` → `CONTOSO-Admin.cred`). |
+| `-StorePath` | `%APPDATA%\ps-cred` | Directory where credential files are stored. |
