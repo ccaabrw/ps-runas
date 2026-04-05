@@ -137,7 +137,8 @@
     does not need interactive logon rights on this machine.
 
 .EXAMPLE
-    .\Start-RunAs.ps1 -UserName "CONTOSO\AdminUser" -ForegroundColor White -BackgroundColor DarkBlue -TitleBarColor '#003366' -WindowTitle "CONTOSO\AdminUser"
+    $cred = Get-Credential -UserName "CONTOSO\AdminUser" -Message "Enter admin credentials"
+    .\Start-RunAs.ps1 -Credential $cred -ForegroundColor White -BackgroundColor DarkBlue -TitleBarColor '#003366' -WindowTitle $cred.UserName
 
     Opens a PowerShell console window with a dark-blue background, white text, and a navy-blue
     title bar (Windows 11 only), making it easy to distinguish the elevated session at a glance.
@@ -357,12 +358,14 @@ if ($WindowTitle) {
 }
 
 if ($TitleBarColor) {
-    # Convert the hex RGB colour string to the Win32 COLORREF integer (BGR byte order).
+    # Convert the six-digit hex RGB string to a Win32 COLORREF integer.
+    # COLORREF is a 32-bit value laid out as 0x00BBGGRR (little-endian BGR),
+    # so the red channel occupies bits 0-7, green bits 8-15, and blue bits 16-23.
     $hex      = $TitleBarColor.TrimStart('#')
-    $r        = [System.Convert]::ToInt32($hex.Substring(0, 2), 16)
-    $g        = [System.Convert]::ToInt32($hex.Substring(2, 2), 16)
-    $b        = [System.Convert]::ToInt32($hex.Substring(4, 2), 16)
-    $colorRef = ($b -shl 16) -bor ($g -shl 8) -bor $r
+    $r        = [System.Convert]::ToInt32($hex.Substring(0, 2), 16)  # chars 0-1 → R
+    $g        = [System.Convert]::ToInt32($hex.Substring(2, 2), 16)  # chars 2-3 → G
+    $b        = [System.Convert]::ToInt32($hex.Substring(4, 2), 16)  # chars 4-5 → B
+    $colorRef = ($b -shl 16) -bor ($g -shl 8) -bor $r               # pack as BGR
 
     # Inject a DwmSetWindowAttribute call (DWMWA_CAPTION_COLOR = 35) into the spawned session.
     # This API requires Windows 11 (build 22000+); the try/catch ensures silent failure on
