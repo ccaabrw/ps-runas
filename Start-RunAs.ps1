@@ -55,6 +55,11 @@
     the settings are prepended to the supplied command string.  When neither is present, the
     settings are injected via -Command so the interactive session starts with them already active.
 
+    When -Domain is specified and -NetOnly is not explicitly provided, -NetOnly is automatically
+    enabled.  Domain admin accounts typically lack interactive logon rights on local machines, so
+    NetOnly mode (network credentials only, local token unchanged) is the safer default.  Pass
+    -NetOnly:$false to override this behaviour and require a full interactive logon instead.
+
 .PARAMETER WindowTitle
     The title to display in the title bar of the spawned PowerShell window.  When omitted, the
     window title is left at the default (the path of the executable).  To automatically show the
@@ -81,6 +86,9 @@
     domain admin accounts in many organisations.  The standard Start-Process -Credential
     path requires that right; -NetOnly does not.
 
+    When -Domain is specified, -NetOnly is enabled automatically unless -NetOnly:$false is
+    passed explicitly.
+
 .EXAMPLE
     .\Start-RunAs.ps1 -UserName "CONTOSO\AdminUser"
 
@@ -104,12 +112,14 @@
 
     Opens a PowerShell console window running as CONTOSO\AdminUser with $PSDefaultParameterValues
     pre-set so that all Active Directory cmdlets target contoso.com without requiring -Server on
-    every call.
+    every call.  Because -Domain is specified, -NetOnly is automatically enabled so the account
+    does not need interactive logon rights on this machine.
 
 .NOTES
     Requires Windows PowerShell 5.1 or PowerShell 7+.
-    The target account must have permission to log on interactively on this machine, unless
-    the -NetOnly switch is used (see -NetOnly for details).
+    The target account must have permission to log on interactively on this machine unless
+    -NetOnly is used (see -NetOnly for details).  When -Domain is specified, -NetOnly is
+    automatically enabled, so interactive logon rights are not required in that case.
     Windows Terminal (wt.exe) is not supported when running as a different user due to MSIX
     packaging restrictions; the session will always open in a plain PowerShell console window.
     PowerShell 7 installed from the Microsoft Store is also MSIX-packaged and subject to the same
@@ -169,6 +179,18 @@ if ($PSCmdlet.ParameterSetName -eq 'ByUserName') {
 
 if (-not $Credential) {
     throw 'No credential supplied – operation cancelled.'
+}
+
+#endregion
+
+#region --- Apply defaults ---------------------------------------------------
+
+# When -Domain is specified, NetOnly is the safer default: privileged domain
+# accounts commonly lack interactive logon rights on local machines, so
+# LOGON_NETONLY (network credentials only, local token unchanged) avoids that
+# restriction.  The caller can opt out by passing -NetOnly:$false explicitly.
+if ($Domain -and -not $PSBoundParameters.ContainsKey('NetOnly')) {
+    $NetOnly = $true
 }
 
 #endregion
