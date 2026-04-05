@@ -93,6 +93,24 @@ Because `-Domain` is specified, `-NetOnly` is automatically enabled — the acco
 interactive logon rights on the local machine.  Pass `-NetOnly:$false` to require a full
 interactive logon instead.
 
+### Record a transcript of the session
+
+```powershell
+.\Start-RunAs.ps1 -UserName "CONTOSO\AdminUser" -TranscriptPath "C:\Logs\admin-session.log"
+```
+
+Opens a PowerShell console window running as `CONTOSO\AdminUser` and automatically starts recording
+a full transcript of all input and output to `C:\Logs\admin-session.log`.  The transcript begins at
+session start and continues until the window is closed.  If the file already exists the new
+transcript is appended to it.
+
+```powershell
+# Combine with other options — record a coloured, titled, NetOnly session
+.\Start-RunAs.ps1 -UserName "CONTOSO\AdminUser" -NetOnly `
+    -WindowTitle "CONTOSO\AdminUser" -BackgroundColor DarkBlue -ForegroundColor White `
+    -TranscriptPath "C:\Logs\admin-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
+```
+
 ---
 
 ## Parameters
@@ -107,6 +125,7 @@ interactive logon instead.
 | `-Domain` | `string` | DNS name or domain controller hostname to set as the default server for Active Directory and DNS Server cmdlets in the new session. Sets `$PSDefaultParameterValues['*-AD*:Server']` and `$PSDefaultParameterValues['*-Dns*:ComputerName']` automatically so you can run `Get-ADUser`, `Get-DnsServerResourceRecord`, etc. without specifying `-Server` or `-ComputerName` on every call. Also automatically enables `-NetOnly` (see above). |
 | `-WindowTitle` | `string` | Title to display in the title bar of the spawned PowerShell window.  When omitted, the window title is left at the default. Pass the credential's `UserName` to show the domain and user name: `-WindowTitle "CONTOSO\AdminUser"`. |
 | `-ArgumentList` | `string[]` | Extra arguments forwarded to the PowerShell executable inside the new session. |
+| `-TranscriptPath` | `string` | Absolute path to a file where a full transcript of the spawned session will be recorded. When specified, `Start-Transcript` is called at session start and records all input and output to the given file. If the file already exists the transcript is appended to it. Parent directories must already exist. |
 
 ---
 

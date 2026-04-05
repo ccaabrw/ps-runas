@@ -95,6 +95,17 @@
 .PARAMETER ArgumentList
     Additional arguments forwarded verbatim to the PowerShell executable inside the new session.
 
+.PARAMETER TranscriptPath
+    Path to a file where a transcript of the spawned session will be recorded.
+    When specified, Start-Transcript is called at the very start of the new session
+    and records all input and output to the given file for the lifetime of the
+    session.  The file is created if it does not exist; if it already exists the
+    transcript is appended to it.
+
+    The path is resolved relative to the working directory of the spawned session
+    (i.e. -WorkingDirectory), so an absolute path is recommended.  Parent
+    directories must already exist.
+
 .PARAMETER NetOnly
     Uses the LOGON_NETONLY logon flag (equivalent to "runas /netonly").
 
@@ -142,6 +153,13 @@
 
     Opens a PowerShell console window with a dark-blue background, white text, and a navy-blue
     title bar (Windows 11 only), making it easy to distinguish the elevated session at a glance.
+
+.EXAMPLE
+    .\Start-RunAs.ps1 -UserName "CONTOSO\AdminUser" -TranscriptPath "C:\Logs\admin-session.log"
+
+    Opens a PowerShell console window running as CONTOSO\AdminUser and automatically starts
+    recording a full transcript of the session to C:\Logs\admin-session.log.  If the file
+    already exists the new transcript is appended to it.
 
 .NOTES
     Requires Windows PowerShell 5.1 or PowerShell 7+.
@@ -200,7 +218,10 @@ param (
     [string] $TitleBarColor,
 
     [Parameter()]
-    [string[]] $ArgumentList
+    [string[]] $ArgumentList,
+
+    [Parameter()]
+    [string] $TranscriptPath
 )
 
 Set-StrictMode -Version Latest
@@ -385,6 +406,11 @@ if ($Domain) {
     $domainEscaped = $Domain.Replace("'", "''")
     $setupParts.Add("`$PSDefaultParameterValues['*-AD*:Server'] = '$domainEscaped'")
     $setupParts.Add("`$PSDefaultParameterValues['*-Dns*:ComputerName'] = '$domainEscaped'")
+}
+
+if ($TranscriptPath) {
+    $transcriptEscaped = $TranscriptPath.Replace("'", "''")
+    $setupParts.Add("Start-Transcript -Path '$transcriptEscaped' -Append")
 }
 
 $setupLine = $setupParts -join '; '
