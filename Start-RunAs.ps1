@@ -55,6 +55,22 @@
     the settings are prepended to the supplied command string.  When neither is present, the
     settings are injected via -Command so the interactive session starts with them already active.
 
+    When -Domain is specified and -NetOnly is not explicitly provided, -NetOnly is automatically
+    enabled.  Domain admin accounts typically lack interactive logon rights on local machines, so
+    NetOnly mode (network credentials only, local token unchanged) is the safer default.  Pass
+    -NetOnly:$false to override this behaviour and require a full interactive logon instead.
+
+.PARAMETER WindowTitle
+    The title to display in the title bar of the spawned PowerShell window.  When omitted, the
+    window title is left at the default (the path of the executable).  To automatically show the
+    domain and user name of the credential, pass the credential's UserName:
+
+        .\Start-RunAs.ps1 -UserName "CONTOSO\AdminUser" -WindowTitle "CONTOSO\AdminUser"
+
+    Or, when using a pre-built credential:
+
+        .\Start-RunAs.ps1 -Credential $cred -WindowTitle $cred.UserName
+
 .PARAMETER ArgumentList
     Additional arguments forwarded verbatim to the PowerShell executable inside the new session.
 
@@ -69,6 +85,9 @@
     (interactive logon) user right on this machine — which is common for privileged
     domain admin accounts in many organisations.  The standard Start-Process -Credential
     path requires that right; -NetOnly does not.
+
+    When -Domain is specified, -NetOnly is enabled automatically unless -NetOnly:$false is
+    passed explicitly.
 
 .EXAMPLE
     .\Start-RunAs.ps1 -UserName "CONTOSO\AdminUser"
@@ -93,12 +112,14 @@
 
     Opens a PowerShell console window running as CONTOSO\AdminUser with $PSDefaultParameterValues
     pre-set so that all Active Directory cmdlets target contoso.com without requiring -Server on
-    every call.
+    every call.  Because -Domain is specified, -NetOnly is automatically enabled so the account
+    does not need interactive logon rights on this machine.
 
 .NOTES
     Requires Windows PowerShell 5.1 or PowerShell 7+.
-    The target account must have permission to log on interactively on this machine, unless
-    the -NetOnly switch is used (see -NetOnly for details).
+    The target account must have permission to log on interactively on this machine unless
+    -NetOnly is used (see -NetOnly for details).  When -Domain is specified, -NetOnly is
+    automatically enabled, so interactive logon rights are not required in that case.
     Windows Terminal (wt.exe) is not supported when running as a different user due to MSIX
     packaging restrictions; the session will always open in a plain PowerShell console window.
     PowerShell 7 installed from the Microsoft Store is also MSIX-packaged and subject to the same
@@ -132,6 +153,9 @@ param (
     [string] $Domain,
 
     [Parameter()]
+    [string] $WindowTitle,
+
+    [Parameter()]
     [string[]] $ArgumentList
 )
 
@@ -155,6 +179,18 @@ if ($PSCmdlet.ParameterSetName -eq 'ByUserName') {
 
 if (-not $Credential) {
     throw 'No credential supplied – operation cancelled.'
+}
+
+#endregion
+
+#region --- Apply defaults ---------------------------------------------------
+
+# When -Domain is specified, NetOnly is the safer default: privileged domain
+# accounts commonly lack interactive logon rights on local machines, so
+# LOGON_NETONLY (network credentials only, local token unchanged) avoids that
+# restriction.  The caller can opt out by passing -NetOnly:$false explicitly.
+if ($Domain -and -not $PSBoundParameters.ContainsKey('NetOnly')) {
+    $NetOnly = $true
 }
 
 #endregion
@@ -253,20 +289,32 @@ if ($ArgumentList) {
     $innerArgs += $ArgumentList
 }
 
-# When -Domain is supplied, inject PSDefaultParameterValues entries so every
-# Active Directory cmdlet and DNS Server cmdlet targets the right domain without
-# requiring an explicit -Server / -ComputerName argument on each call.
+# When -WindowTitle and/or -Domain are supplied, build a combined setup line that
+# is injected into the inner shell's startup command.  Both features use the same
+# injection paths (-Command prepend, -File wrapper, or interactive -Command), so
+# they are always applied together in a single pass.
+$setupParts = [System.Collections.Generic.List[string]]::new()
+
+if ($WindowTitle) {
+    $titleEscaped = $WindowTitle.Replace("'", "''")
+    $setupParts.Add("`$host.UI.RawUI.WindowTitle = '$titleEscaped'")
+}
+
 if ($Domain) {
     $domainEscaped = $Domain.Replace("'", "''")
-    $setupLine     = "`$PSDefaultParameterValues['*-AD*:Server'] = '$domainEscaped'; " +
-                     "`$PSDefaultParameterValues['*-Dns*:ComputerName'] = '$domainEscaped'"
+    $setupParts.Add("`$PSDefaultParameterValues['*-AD*:Server'] = '$domainEscaped'")
+    $setupParts.Add("`$PSDefaultParameterValues['*-Dns*:ComputerName'] = '$domainEscaped'")
+}
 
+$setupLine = $setupParts -join '; '
+
+if ($setupLine) {
     $argArray   = [string[]] $innerArgs
     $commandIdx = [Array]::IndexOf($argArray, '-Command')
     $fileIdx    = [Array]::IndexOf($argArray, '-File')
 
     if ($commandIdx -ge 0 -and ($commandIdx + 1) -lt $argArray.Length) {
-        # Prepend the domain setup to the existing -Command value.
+        # Prepend the setup to the existing -Command value.
         $argArray[$commandIdx + 1] = "$setupLine; " + $argArray[$commandIdx + 1]
         $innerArgs = $argArray
     } elseif ($fileIdx -ge 0) {
@@ -275,13 +323,13 @@ if ($Domain) {
             # invocation that would fail regardless.  Skip injection and leave $innerArgs
             # as-is so PowerShell surfaces the real error to the user.
             Write-Warning ("'-File' was found in -ArgumentList but has no following script " +
-                           "path.  The -Domain PSDefaultParameterValues setup cannot be " +
-                           "injected.  Verify that -ArgumentList is well-formed.")
+                           "path.  The setup commands (window title / domain defaults) cannot " +
+                           "be injected.  Verify that -ArgumentList is well-formed.")
         } else {
-        # -File mode: replace the target script with a temporary wrapper that sets
-        # $PSDefaultParameterValues first, then calls the original script.  The
-        # wrapper removes itself in a finally block (the file has been fully parsed
-        # into memory before execution begins, so self-deletion is safe).
+        # -File mode: replace the target script with a temporary wrapper that applies
+        # setup commands first, then calls the original script.  The wrapper removes
+        # itself in a finally block (the file has been fully parsed into memory before
+        # execution begins, so self-deletion is safe).
         $origScript  = $argArray[$fileIdx + 1]
         $scriptArgs  = if ($argArray.Length -gt $fileIdx + 2) {
             $argArray[($fileIdx + 2)..($argArray.Length - 1)]
@@ -315,7 +363,7 @@ if ($Domain) {
     } else {
         # Interactive mode (no -File or -Command in $ArgumentList): append the
         # setup via -Command.  -NoExit placed before -Command keeps the window
-        # open after the one-liner executes, leaving a ready-to-use AD session.
+        # open after the one-liner executes, leaving a ready-to-use session.
         # Preserve any other flags (e.g. -NoProfile) that were already in $argArray.
         $innerArgs = $argArray + @('-Command', $setupLine)
     }
