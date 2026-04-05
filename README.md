@@ -68,6 +68,15 @@ $cred = Get-Credential -UserName "CONTOSO\AdminUser" -Message "Enter admin crede
 The new window runs locally as your own account but all network access (Active Directory,
 UNC paths, etc.) uses the specified credentials — identical to `runas /netonly`.
 
+### Set the window title to show the domain and user
+
+```powershell
+.\Start-RunAs.ps1 -UserName "CONTOSO\AdminUser" -WindowTitle "CONTOSO\AdminUser"
+```
+
+The title bar of the new PowerShell window will read `CONTOSO\AdminUser`, making it easy to
+identify which account each window is running under when you have multiple sessions open.
+
 ### Pre-configure Active Directory cmdlets to target a specific domain
 
 ```powershell
@@ -92,6 +101,7 @@ automatically target that domain without requiring `-Server` or `-ComputerName` 
 | `-NoNewWindow` | `switch` | Accepted for backwards compatibility; has no effect (Windows Terminal cannot be launched as a different user). |
 | `-NetOnly` | `switch` | Uses `LOGON_NETONLY` (equivalent to `runas /netonly`). The new PowerShell window runs under your own local account but uses the supplied credentials for all network access (AD, UNC paths, etc.). Use this when the target account does not have interactive logon rights on this machine. |
 | `-Domain` | `string` | DNS name or domain controller hostname to set as the default server for Active Directory and DNS Server cmdlets in the new session. Sets `$PSDefaultParameterValues['*-AD*:Server']` and `$PSDefaultParameterValues['*-Dns*:ComputerName']` automatically so you can run `Get-ADUser`, `Get-DnsServerResourceRecord`, etc. without specifying `-Server` or `-ComputerName` on every call. |
+| `-WindowTitle` | `string` | Title to display in the title bar of the spawned PowerShell window.  When omitted, the window title is left at the default. Pass the credential's `UserName` to show the domain and user name: `-WindowTitle "CONTOSO\AdminUser"`. |
 | `-ArgumentList` | `string[]` | Extra arguments forwarded to the PowerShell executable inside the new session. |
 
 ---
