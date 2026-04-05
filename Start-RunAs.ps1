@@ -39,6 +39,22 @@
     Windows Terminal (wt.exe) cannot be launched as a different user (MSIX packaging
     restriction), so the session always opens in a plain PowerShell console window.
 
+.PARAMETER Domain
+    The Active Directory domain (DNS name or domain controller host name) to set as the default
+    target for Active Directory and DNS Server cmdlets in the new session.  When this parameter
+    is supplied, the spawned PowerShell window will have:
+
+        $PSDefaultParameterValues['*-AD*:Server']       = '<Domain>'
+        $PSDefaultParameterValues['*-Dns*:ComputerName'] = '<Domain>'
+
+    pre-configured, so you can run Get-ADUser, Get-ADGroup, Get-DnsServerResourceRecord, etc.
+    without having to specify -Server or -ComputerName on every call.
+
+    When -ArgumentList contains -File, a temporary wrapper script is created that applies the
+    settings before executing the specified script file.  When -ArgumentList contains -Command,
+    the settings are prepended to the supplied command string.  When neither is present, the
+    settings are injected via -Command so the interactive session starts with them already active.
+
 .PARAMETER ArgumentList
     Additional arguments forwarded verbatim to the PowerShell executable inside the new session.
 
@@ -72,6 +88,13 @@
     Opens a PowerShell console window running as CONTOSO\AdminUser with C:\AdminTools as the
     starting directory.
 
+.EXAMPLE
+    .\Start-RunAs.ps1 -UserName "CONTOSO\AdminUser" -Domain "contoso.com"
+
+    Opens a PowerShell console window running as CONTOSO\AdminUser with $PSDefaultParameterValues
+    pre-set so that all Active Directory cmdlets target contoso.com without requiring -Server on
+    every call.
+
 .NOTES
     Requires Windows PowerShell 5.1 or PowerShell 7+.
     The target account must have permission to log on interactively on this machine, unless
@@ -104,6 +127,9 @@ param (
 
     [Parameter()]
     [switch] $NetOnly,
+
+    [Parameter()]
+    [string] $Domain,
 
     [Parameter()]
     [string[]] $ArgumentList
@@ -225,6 +251,74 @@ $innerArgs = @('-NoExit')
 
 if ($ArgumentList) {
     $innerArgs += $ArgumentList
+}
+
+# When -Domain is supplied, inject PSDefaultParameterValues entries so every
+# Active Directory cmdlet and DNS Server cmdlet targets the right domain without
+# requiring an explicit -Server / -ComputerName argument on each call.
+if ($Domain) {
+    $domainEscaped = $Domain.Replace("'", "''")
+    $setupLine     = "`$PSDefaultParameterValues['*-AD*:Server'] = '$domainEscaped'; " +
+                     "`$PSDefaultParameterValues['*-Dns*:ComputerName'] = '$domainEscaped'"
+
+    $argArray   = [string[]] $innerArgs
+    $commandIdx = [Array]::IndexOf($argArray, '-Command')
+    $fileIdx    = [Array]::IndexOf($argArray, '-File')
+
+    if ($commandIdx -ge 0 -and ($commandIdx + 1) -lt $argArray.Length) {
+        # Prepend the domain setup to the existing -Command value.
+        $argArray[$commandIdx + 1] = "$setupLine; " + $argArray[$commandIdx + 1]
+        $innerArgs = $argArray
+    } elseif ($fileIdx -ge 0) {
+        if (($fileIdx + 1) -ge $argArray.Length) {
+            # -File is present but has no following script path – this is a malformed
+            # invocation that would fail regardless.  Skip injection and leave $innerArgs
+            # as-is so PowerShell surfaces the real error to the user.
+            Write-Warning ("'-File' was found in -ArgumentList but has no following script " +
+                           "path.  The -Domain PSDefaultParameterValues setup cannot be " +
+                           "injected.  Verify that -ArgumentList is well-formed.")
+        } else {
+        # -File mode: replace the target script with a temporary wrapper that sets
+        # $PSDefaultParameterValues first, then calls the original script.  The
+        # wrapper removes itself in a finally block (the file has been fully parsed
+        # into memory before execution begins, so self-deletion is safe).
+        $origScript  = $argArray[$fileIdx + 1]
+        $scriptArgs  = if ($argArray.Length -gt $fileIdx + 2) {
+            $argArray[($fileIdx + 2)..($argArray.Length - 1)]
+        } else { @() }
+
+        # Build the forwarded call line, quoting each token individually.
+        $quotedOrig       = "'" + $origScript.Replace("'", "''") + "'"
+        $quotedScriptArgs = $scriptArgs | ForEach-Object { "'" + $_.Replace("'", "''") + "'" }
+        $callLine         = ('& ' + ((@($quotedOrig) + @($quotedScriptArgs)) -join ' ')).TrimEnd()
+
+        # Use GetRandomFileName to avoid the orphaned .tmp file left by GetTempFileName.
+        $wrapperPath    = Join-Path ([System.IO.Path]::GetTempPath()) `
+                              ([System.IO.Path]::ChangeExtension([System.IO.Path]::GetRandomFileName(), 'ps1'))
+        $wrapperContent = @(
+            $setupLine,
+            'try {',
+            "    $callLine",
+            '} finally {',
+            '    Remove-Item -LiteralPath $PSCommandPath -ErrorAction SilentlyContinue',
+            '}'
+        )
+        $wrapperContent | Set-Content -LiteralPath $wrapperPath -Encoding UTF8
+
+        # Rebuild inner args: keep everything before -File, then add -File <wrapper>.
+        # Any forwarded script args are baked into the wrapper; drop them here.
+        # When $fileIdx is 0 there are no arguments before -File, so use an empty
+        # array to avoid the 0..-1 PowerShell range producing unexpected results.
+        $prefix    = if ($fileIdx -gt 0) { $argArray[0..($fileIdx - 1)] } else { @() }
+        $innerArgs = $prefix + @('-File', $wrapperPath)
+        }
+    } else {
+        # Interactive mode (no -File or -Command in $ArgumentList): append the
+        # setup via -Command.  -NoExit placed before -Command keeps the window
+        # open after the one-liner executes, leaving a ready-to-use AD session.
+        # Preserve any other flags (e.g. -NoProfile) that were already in $argArray.
+        $innerArgs = $argArray + @('-Command', $setupLine)
+    }
 }
 
 #endregion
