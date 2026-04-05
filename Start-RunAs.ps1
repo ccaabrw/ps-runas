@@ -71,6 +71,27 @@
 
         .\Start-RunAs.ps1 -Credential $cred -WindowTitle $cred.UserName
 
+.PARAMETER ForegroundColor
+    The foreground (text) colour of the spawned PowerShell console window.  Accepts any named
+    value from the System.ConsoleColor enumeration, e.g. 'White', 'Green', or 'Cyan'.  When
+    omitted, the console keeps its default foreground colour.
+
+.PARAMETER BackgroundColor
+    The background colour of the spawned PowerShell console window.  Accepts any named value from
+    the System.ConsoleColor enumeration, e.g. 'DarkBlue', 'Black', or 'DarkGray'.  When omitted,
+    the console keeps its default background colour.
+
+    When specified, Clear-Host is called after the colour is applied so that the entire console
+    buffer is repainted with the new background.
+
+.PARAMETER TitleBarColor
+    The background colour of the window title bar, expressed as a six-digit hex RGB colour code
+    with an optional leading '#', e.g. '#1E3A5F' or '1E3A5F'.
+
+    This feature uses the DwmSetWindowAttribute API (DWMWA_CAPTION_COLOR) which is available on
+    Windows 11 (build 22000) and later.  On earlier Windows versions the parameter is silently
+    ignored.
+
 .PARAMETER ArgumentList
     Additional arguments forwarded verbatim to the PowerShell executable inside the new session.
 
@@ -115,6 +136,12 @@
     every call.  Because -Domain is specified, -NetOnly is automatically enabled so the account
     does not need interactive logon rights on this machine.
 
+.EXAMPLE
+    .\Start-RunAs.ps1 -UserName "CONTOSO\AdminUser" -ForegroundColor White -BackgroundColor DarkBlue -TitleBarColor '#003366' -WindowTitle "CONTOSO\AdminUser"
+
+    Opens a PowerShell console window with a dark-blue background, white text, and a navy-blue
+    title bar (Windows 11 only), making it easy to distinguish the elevated session at a glance.
+
 .NOTES
     Requires Windows PowerShell 5.1 or PowerShell 7+.
     The target account must have permission to log on interactively on this machine unless
@@ -154,6 +181,22 @@ param (
 
     [Parameter()]
     [string] $WindowTitle,
+
+    [Parameter()]
+    [ValidateSet('Black', 'DarkBlue', 'DarkGreen', 'DarkCyan', 'DarkRed', 'DarkMagenta',
+                 'DarkYellow', 'Gray', 'DarkGray', 'Blue', 'Green', 'Cyan', 'Red',
+                 'Magenta', 'Yellow', 'White')]
+    [string] $ForegroundColor,
+
+    [Parameter()]
+    [ValidateSet('Black', 'DarkBlue', 'DarkGreen', 'DarkCyan', 'DarkRed', 'DarkMagenta',
+                 'DarkYellow', 'Gray', 'DarkGray', 'Blue', 'Green', 'Cyan', 'Red',
+                 'Magenta', 'Yellow', 'White')]
+    [string] $BackgroundColor,
+
+    [Parameter()]
+    [ValidatePattern('^#?[0-9A-Fa-f]{6}$')]
+    [string] $TitleBarColor,
 
     [Parameter()]
     [string[]] $ArgumentList
@@ -289,15 +332,50 @@ if ($ArgumentList) {
     $innerArgs += $ArgumentList
 }
 
-# When -WindowTitle and/or -Domain are supplied, build a combined setup line that
-# is injected into the inner shell's startup command.  Both features use the same
-# injection paths (-Command prepend, -File wrapper, or interactive -Command), so
-# they are always applied together in a single pass.
+# When -WindowTitle, -ForegroundColor, -BackgroundColor, -TitleBarColor, and/or -Domain are
+# supplied, build a combined setup line that is injected into the inner shell's startup command.
+# All features use the same injection paths (-Command prepend, -File wrapper, or interactive
+# -Command), so they are always applied together in a single pass.
 $setupParts = [System.Collections.Generic.List[string]]::new()
+
+if ($BackgroundColor) {
+    $setupParts.Add("`$host.UI.RawUI.BackgroundColor = [System.ConsoleColor]::$BackgroundColor")
+}
+
+if ($ForegroundColor) {
+    $setupParts.Add("`$host.UI.RawUI.ForegroundColor = [System.ConsoleColor]::$ForegroundColor")
+}
+
+# Repaint the full console buffer so the new background fills the entire window.
+if ($BackgroundColor) {
+    $setupParts.Add('Clear-Host')
+}
 
 if ($WindowTitle) {
     $titleEscaped = $WindowTitle.Replace("'", "''")
     $setupParts.Add("`$host.UI.RawUI.WindowTitle = '$titleEscaped'")
+}
+
+if ($TitleBarColor) {
+    # Convert the hex RGB colour string to the Win32 COLORREF integer (BGR byte order).
+    $hex      = $TitleBarColor.TrimStart('#')
+    $r        = [System.Convert]::ToInt32($hex.Substring(0, 2), 16)
+    $g        = [System.Convert]::ToInt32($hex.Substring(2, 2), 16)
+    $b        = [System.Convert]::ToInt32($hex.Substring(4, 2), 16)
+    $colorRef = ($b -shl 16) -bor ($g -shl 8) -bor $r
+
+    # Inject a DwmSetWindowAttribute call (DWMWA_CAPTION_COLOR = 35) into the spawned session.
+    # This API requires Windows 11 (build 22000+); the try/catch ensures silent failure on
+    # older systems.  Single-quoted literals inside the generated code avoid further escaping.
+    $dwmCode = 'try { ' +
+               'if (-not (''PsRunAsInternal.DwmHelper'' -as [type])) { ' +
+               'Add-Type -Name DwmHelper -Namespace PsRunAsInternal ' +
+               '-MemberDefinition ''[DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int pvAttr, int cbAttr);'' ' +
+               '}; ' +
+               ('$_tbColor = {0}; ' -f $colorRef) +
+               '[PsRunAsInternal.DwmHelper]::DwmSetWindowAttribute((Get-Process -Id $PID).MainWindowHandle, 35, [ref]$_tbColor, 4) | Out-Null ' +
+               '} catch { }'
+    $setupParts.Add($dwmCode)
 }
 
 if ($Domain) {
@@ -323,7 +401,7 @@ if ($setupLine) {
             # invocation that would fail regardless.  Skip injection and leave $innerArgs
             # as-is so PowerShell surfaces the real error to the user.
             Write-Warning ("'-File' was found in -ArgumentList but has no following script " +
-                           "path.  The setup commands (window title / domain defaults) cannot " +
+                           "path.  The setup commands (console colours / window title / domain defaults) cannot " +
                            "be injected.  Verify that -ArgumentList is well-formed.")
         } else {
         # -File mode: replace the target script with a temporary wrapper that applies
