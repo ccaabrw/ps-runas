@@ -41,18 +41,19 @@
 
 .PARAMETER Domain
     The Active Directory domain (DNS name or domain controller host name) to set as the default
-    -Server value for all Active Directory cmdlets in the new session.  When this parameter is
-    supplied, the spawned PowerShell window will have:
+    target for Active Directory and DNS Server cmdlets in the new session.  When this parameter
+    is supplied, the spawned PowerShell window will have:
 
-        $PSDefaultParameterValues['*-AD*:Server'] = '<Domain>'
+        $PSDefaultParameterValues['*-AD*:Server']       = '<Domain>'
+        $PSDefaultParameterValues['*-Dns*:ComputerName'] = '<Domain>'
 
-    pre-configured, so you can run Get-ADUser, Get-ADGroup, etc. without having to specify
-    -Server on every call.
+    pre-configured, so you can run Get-ADUser, Get-ADGroup, Get-DnsServerResourceRecord, etc.
+    without having to specify -Server or -ComputerName on every call.
 
     When -ArgumentList contains -File, a temporary wrapper script is created that applies the
-    setting before executing the specified script file.  When -ArgumentList contains -Command,
-    the setting is prepended to the supplied command string.  When neither is present, the
-    setting is injected via -Command so the interactive session starts with it already active.
+    settings before executing the specified script file.  When -ArgumentList contains -Command,
+    the settings are prepended to the supplied command string.  When neither is present, the
+    settings are injected via -Command so the interactive session starts with them already active.
 
 .PARAMETER ArgumentList
     Additional arguments forwarded verbatim to the PowerShell executable inside the new session.
@@ -252,12 +253,13 @@ if ($ArgumentList) {
     $innerArgs += $ArgumentList
 }
 
-# When -Domain is supplied, inject "$PSDefaultParameterValues['*-AD*:Server'] = '<domain>'"
-# into the spawned session so every Active Directory cmdlet targets the right domain without
-# requiring an explicit -Server argument on each call.
+# When -Domain is supplied, inject PSDefaultParameterValues entries so every
+# Active Directory cmdlet and DNS Server cmdlet targets the right domain without
+# requiring an explicit -Server / -ComputerName argument on each call.
 if ($Domain) {
     $domainEscaped = $Domain.Replace("'", "''")
-    $setupLine     = "`$PSDefaultParameterValues['*-AD*:Server'] = '$domainEscaped'"
+    $setupLine     = "`$PSDefaultParameterValues['*-AD*:Server'] = '$domainEscaped'; " +
+                     "`$PSDefaultParameterValues['*-Dns*:ComputerName'] = '$domainEscaped'"
 
     $argArray   = [string[]] $innerArgs
     $commandIdx = [Array]::IndexOf($argArray, '-Command')

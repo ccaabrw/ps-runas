@@ -99,9 +99,10 @@ $adScript = @"
 # Domain    : $Domain
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Set the default -Server for all AD cmdlets so interactive commands do not
-# need to specify -Server explicitly.
+# Set the default -Server for all AD cmdlets and -ComputerName for DNS Server
+# cmdlets so interactive commands do not need to specify them explicitly.
 `$PSDefaultParameterValues['*-AD*:Server'] = '$Domain'
+`$PSDefaultParameterValues['*-Dns*:ComputerName'] = '$Domain'
 
 # 1. Import the ActiveDirectory module (requires RSAT to be installed)
 Import-Module ActiveDirectory -ErrorAction Stop
