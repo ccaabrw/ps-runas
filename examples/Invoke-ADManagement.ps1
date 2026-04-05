@@ -99,6 +99,10 @@ $adScript = @"
 # Domain    : $Domain
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Set the default -Server for all AD cmdlets so interactive commands do not
+# need to specify -Server explicitly.
+`$PSDefaultParameterValues['*-AD*:Server'] = '$Domain'
+
 # 1. Import the ActiveDirectory module (requires RSAT to be installed)
 Import-Module ActiveDirectory -ErrorAction Stop
 Write-Host 'ActiveDirectory module loaded.' -ForegroundColor Green

@@ -68,6 +68,17 @@ $cred = Get-Credential -UserName "CONTOSO\AdminUser" -Message "Enter admin crede
 The new window runs locally as your own account but all network access (Active Directory,
 UNC paths, etc.) uses the specified credentials — identical to `runas /netonly`.
 
+### Pre-configure Active Directory cmdlets to target a specific domain
+
+```powershell
+.\Start-RunAs.ps1 -UserName "CONTOSO\AdminUser" -Domain "contoso.com"
+```
+
+Opens a PowerShell console window running as `CONTOSO\AdminUser` with
+`$PSDefaultParameterValues['*-AD*:Server']` pre-set to `contoso.com`.  All AD cmdlets
+(`Get-ADUser`, `Get-ADGroup`, `Get-ADComputer`, …) will automatically target that domain
+without requiring `-Server` on every call.
+
 ---
 
 ## Parameters
@@ -79,6 +90,7 @@ UNC paths, etc.) uses the specified credentials — identical to `runas /netonly
 | `-WorkingDirectory` | `string` | Starting directory for the new session. Defaults to the current directory. |
 | `-NoNewWindow` | `switch` | Accepted for backwards compatibility; has no effect (Windows Terminal cannot be launched as a different user). |
 | `-NetOnly` | `switch` | Uses `LOGON_NETONLY` (equivalent to `runas /netonly`). The new PowerShell window runs under your own local account but uses the supplied credentials for all network access (AD, UNC paths, etc.). Use this when the target account does not have interactive logon rights on this machine. |
+| `-Domain` | `string` | DNS name or domain controller hostname to set as the default `-Server` for all Active Directory cmdlets in the new session. Sets `$PSDefaultParameterValues['*-AD*:Server']` automatically so you can run `Get-ADUser`, `Get-ADGroup`, etc. without specifying `-Server` on every call. |
 | `-ArgumentList` | `string[]` | Extra arguments forwarded to the PowerShell executable inside the new session. |
 
 ---
