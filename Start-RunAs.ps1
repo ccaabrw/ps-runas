@@ -121,6 +121,24 @@
     When -Domain is specified, -NetOnly is enabled automatically unless -NetOnly:$false is
     passed explicitly.
 
+.PARAMETER Diagnostic
+    When specified together with -NetOnly, the spawned session's credential-registration
+    startup script writes a structured diagnostic log to a file in $env:TEMP named
+    Start-RunAs-diag-<timestamp>.log and prints the path to the spawned console at startup.
+
+    The log records: timestamp, current user/domain, thread identity and impersonation level
+    before any operations, the LogonUser username/domain arguments (never the password), the
+    result of each P/Invoke call (CredWrite, LogonUser, ImpersonateLoggedOnUser) including the
+    Win32 error code and message on failure, thread identity after impersonation, and the full
+    exception chain if the startup block throws.
+
+    Usage example:
+        .\Start-RunAs.ps1 -UserName "CONTOSO\AdminUser" -Domain "contoso.com" -Diagnostic
+    Then in the spawned window:
+        Get-Content $env:TEMP\Start-RunAs-diag-*.log
+
+    This parameter has no effect when -NetOnly is not active.
+
 .EXAMPLE
     .\Start-RunAs.ps1 -UserName "CONTOSO\AdminUser"
 
@@ -194,6 +212,9 @@ param (
 
     [Parameter()]
     [switch] $NetOnly,
+
+    [Parameter()]
+    [switch] $Diagnostic,
 
     [Parameter()]
     [string] $Domain,
@@ -497,10 +518,27 @@ if ($NetOnly) {
         } else {
             '$null'
         }
+        # Bake the diagnostic flag into the generated script as a literal so no
+        # parameter passing is needed across the process boundary.
+        $diagEnabledLiteral  = if ($Diagnostic) { '$true' } else { '$false' }
         $netOnlyCredScript   = Join-Path ([System.IO.Path]::GetTempPath()) `
                                    ([System.IO.Path]::ChangeExtension(
                                        [System.IO.Path]::GetRandomFileName(), 'ps1'))
         @"
+`$_diagEnabled = $diagEnabledLiteral
+`$_diagLog     = `$null
+`$_diag        = [System.Collections.Generic.List[string]]::new()
+if (`$_diagEnabled) {
+    `$_diagLog = [System.IO.Path]::Combine(`$env:TEMP, ('Start-RunAs-diag-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.log'))
+    `$_diag.Add('[' + (Get-Date -Format 'o') + '] Start-RunAs credential startup diagnostic')
+    `$_diag.Add('  env:USERNAME   = ' + `$env:USERNAME)
+    `$_diag.Add('  env:USERDOMAIN = ' + `$env:USERDOMAIN)
+    `$_id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    `$_diag.Add('  identity (before)             = ' + `$_id.Name)
+    `$_diag.Add('  impersonation level (before)  = ' + `$_id.ImpersonationLevel)
+    `$_id.Dispose()
+    `$_diag.Add('  LogonUser args: username=$credUserForLogon  domain=$credDomainLogonArg')
+}
 try {
     if (-not ('PsRunAsInternal.CredMgr' -as [type])) {
         Add-Type -TypeDefinition @'
@@ -559,7 +597,15 @@ namespace PsRunAsInternal {
         `$_ce.Persist           = [PsRunAsInternal.CredMgr]::CRED_PERSIST_SESSION
         `$_ce.CredentialBlobSize = [uint32](`$_sec.Length * 2)
         `$_ce.CredentialBlob    = `$_ptr
-        [PsRunAsInternal.CredMgr]::CredWrite([ref]`$_ce, 0) | Out-Null
+        `$_credWriteOk  = [PsRunAsInternal.CredMgr]::CredWrite([ref]`$_ce, 0)
+        `$_w32eCredWrite = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        if (`$_diagEnabled) {
+            if (`$_credWriteOk) {
+                `$_diag.Add('  CredWrite: succeeded')
+            } else {
+                `$_diag.Add('  CredWrite: FAILED  Win32=' + `$_w32eCredWrite + '  ' + ([System.ComponentModel.Win32Exception]::new(`$_w32eCredWrite)).Message)
+            }
+        }
         # Use LogonUser(LOGON32_LOGON_NEW_CREDENTIALS) + ImpersonateLoggedOnUser to
         # install the domain credential directly into LSA on the main PowerShell
         # thread.  This is more authoritative than CredWrite alone: Kerberos TGT
@@ -573,20 +619,56 @@ namespace PsRunAsInternal {
         # RevertToSelf is intentionally not called so the session persists for the
         # lifetime of the interactive shell.
         `$_logonToken = [IntPtr]::Zero
-        if ([PsRunAsInternal.LogonHelper]::LogonUser(
+        `$_logonOk    = [PsRunAsInternal.LogonHelper]::LogonUser(
                 '$credUserForLogon', $credDomainLogonArg, `$_ptr,
                 [PsRunAsInternal.LogonHelper]::LOGON32_LOGON_NEW_CREDENTIALS,
                 [PsRunAsInternal.LogonHelper]::LOGON32_PROVIDER_WINNT50,
-                [ref]`$_logonToken) -and `$_logonToken -ne [IntPtr]::Zero) {
-            [PsRunAsInternal.LogonHelper]::ImpersonateLoggedOnUser(`$_logonToken) | Out-Null
+                [ref]`$_logonToken)
+        `$_w32eLogon = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        if (`$_diagEnabled) {
+            if (`$_logonOk) {
+                `$_diag.Add('  LogonUser: succeeded  token=' + `$_logonToken)
+            } else {
+                `$_diag.Add('  LogonUser: FAILED  Win32=' + `$_w32eLogon + '  ' + ([System.ComponentModel.Win32Exception]::new(`$_w32eLogon)).Message)
+            }
+        }
+        if (`$_logonOk -and `$_logonToken -ne [IntPtr]::Zero) {
+            `$_impersonateOk    = [PsRunAsInternal.LogonHelper]::ImpersonateLoggedOnUser(`$_logonToken)
+            `$_w32eImpersonate  = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            if (`$_diagEnabled) {
+                if (`$_impersonateOk) {
+                    `$_diag.Add('  ImpersonateLoggedOnUser: succeeded')
+                    `$_id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+                    `$_diag.Add('  identity (after)             = ' + `$_id.Name)
+                    `$_diag.Add('  impersonation level (after)  = ' + `$_id.ImpersonationLevel)
+                    `$_id.Dispose()
+                } else {
+                    `$_diag.Add('  ImpersonateLoggedOnUser: FAILED  Win32=' + `$_w32eImpersonate + '  ' + ([System.ComponentModel.Win32Exception]::new(`$_w32eImpersonate)).Message)
+                }
+            }
             [PsRunAsInternal.LogonHelper]::CloseHandle(`$_logonToken) | Out-Null
         }
     } finally {
         [System.Runtime.InteropServices.Marshal]::ZeroFreeGlobalAllocUnicode(`$_ptr)
         `$_sec.Dispose()
-        Remove-Variable -Name '_ptr','_ce','_sec','_key','_logonToken' -ErrorAction SilentlyContinue
+        # Explicitly clear security-sensitive variables holding crypto/handle data.
+        Remove-Variable -Name '_ptr','_sec','_key','_logonToken' -ErrorAction SilentlyContinue
     }
-} catch {} finally {
+} catch {
+    if (`$_diagEnabled) {
+        `$_ex = `$_.Exception
+        while (`$_ex) {
+            `$_diag.Add('  EXCEPTION: [' + `$_ex.GetType().FullName + '] ' + `$_ex.Message)
+            `$_ex = `$_ex.InnerException
+        }
+    }
+} finally {
+    if (`$_diagEnabled -and `$_diagLog) {
+        `$_diag | Set-Content -LiteralPath `$_diagLog -Encoding UTF8
+        Write-Host ('[Start-RunAs] Credential startup log: ' + `$_diagLog) -ForegroundColor Yellow
+    }
+    # Clean up all script-private variables (all use the _ prefix).
+    Get-Variable -Name '_*' -Scope Local -ErrorAction SilentlyContinue | Remove-Variable -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath `$PSCommandPath -Force -ErrorAction SilentlyContinue
 }
 "@ | Set-Content -LiteralPath $netOnlyCredScript -Encoding UTF8
