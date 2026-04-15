@@ -817,17 +817,17 @@ namespace PsRunAsInternal {
         # step (e.g. the OS reported a virtualized image path).  Retry with the known
         # non-MSIX PowerShell executables before surfacing the error to the user.
         # Recent Windows security updates can also cause Start-Process -Credential to
-        # throw System.Security.Authentication.AuthenticationException ("Authentication
-        # failed, see inner exception.") instead of Win32Exception 1326 for the same
-        # failure.  That exception may be nested several levels deep in the chain
-        # (e.g. MethodInvocationException → InvalidOperationException →
-        # AuthenticationException), so walk the entire InnerException chain.
+        # throw System.InvalidOperationException ("Authentication failed, see inner
+        # exception.") — the outer exception is NOT typed as AuthenticationException;
+        # the type check alone is therefore insufficient.  Walk the entire InnerException
+        # chain and match on both the type and the message.
         $isLogonFailure = $false
         $searchEx = $_.Exception
         while ($searchEx -and -not $isLogonFailure) {
             $win32Ex = $searchEx -as [System.ComponentModel.Win32Exception]
             $isLogonFailure = ($win32Ex -and $win32Ex.NativeErrorCode -eq 1326) -or
                               ($searchEx.Message -like '*user name or password*') -or
+                              ($searchEx.Message -like '*Authentication failed*') -or
                               ($searchEx -is [System.Security.Authentication.AuthenticationException])
             $searchEx = $searchEx.InnerException
         }
@@ -855,16 +855,18 @@ namespace PsRunAsInternal {
                 $launched = $true
                 break
             } catch {
-                # Only suppress logon-failure errors (Win32 1326 or AuthenticationException at
-                # any nesting depth), which may indicate that this candidate is also
-                # MSIX-packaged.  Any other error is real (e.g. wrong credentials, logon type
-                # not permitted) and should be surfaced immediately rather than silently discarded.
+                # Only suppress logon-failure errors (Win32 1326, "Authentication failed"
+                # message, or AuthenticationException at any nesting depth), which may
+                # indicate that this candidate is also MSIX-packaged.  Any other error is
+                # real (e.g. wrong credentials, logon type not permitted) and should be
+                # surfaced immediately rather than silently discarded.
                 $isRetryLogonFailure = $false
                 $searchEx = $_.Exception
                 while ($searchEx -and -not $isRetryLogonFailure) {
                     $retryWin32Ex = $searchEx -as [System.ComponentModel.Win32Exception]
                     $isRetryLogonFailure = ($retryWin32Ex -and $retryWin32Ex.NativeErrorCode -eq 1326) -or
                                            ($searchEx.Message -like '*user name or password*') -or
+                                           ($searchEx.Message -like '*Authentication failed*') -or
                                            ($searchEx -is [System.Security.Authentication.AuthenticationException])
                     $searchEx = $searchEx.InnerException
                 }
