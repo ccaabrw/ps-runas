@@ -505,6 +505,7 @@ namespace PsRunAsInternal {
         [PsRunAsInternal.CredMgr]::CredWrite([ref]`$_ce, 0) | Out-Null
     } finally {
         [System.Runtime.InteropServices.Marshal]::ZeroFreeGlobalAllocUnicode(`$_ptr)
+        `$_sec.Dispose()
         Remove-Variable -Name '_ptr','_ce','_sec' -ErrorAction SilentlyContinue
     }
 } catch {} finally {
@@ -857,11 +858,13 @@ namespace PsRunAsInternal {
             # Surface the underlying Win32 error so the user can diagnose the real
             # cause (e.g. wrong password, account locked, domain unreachable, missing
             # interactive logon right) rather than seeing only the generic message.
-            # Walk the full exception chain to find the deepest Win32Exception.
+            # Walk the full exception chain and keep the deepest Win32Exception found,
+            # as the innermost one typically carries the most specific error code.
             $lcWin32 = $null
             $searchEx = $lastCaughtError.Exception
-            while ($searchEx -and -not $lcWin32) {
-                $lcWin32 = $searchEx -as [System.ComponentModel.Win32Exception]
+            while ($searchEx) {
+                $candidate = $searchEx -as [System.ComponentModel.Win32Exception]
+                if ($candidate) { $lcWin32 = $candidate }
                 $searchEx = $searchEx.InnerException
             }
             $errDetail = if ($lcWin32) {
