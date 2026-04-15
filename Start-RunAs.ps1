@@ -456,14 +456,6 @@ if ($Domain) {
     $domainEscaped = $Domain.Replace("'", "''")
     $setupParts.Add("`$PSDefaultParameterValues['*-AD*:Server'] = '$domainEscaped'")
     $setupParts.Add("`$PSDefaultParameterValues['*-Dns*:ComputerName'] = '$domainEscaped'")
-    if ($NetOnly) {
-        # When the credential script is dot-sourced it leaves $psRunAsCredential in
-        # scope.  Bind it as the default -Credential for all AD cmdlets so that
-        # async LDAP/ADWS operations (which do not inherit the Win32 thread
-        # impersonation token set by ImpersonateLoggedOnUser) still authenticate with
-        # the domain credential rather than falling back to the process identity.
-        $setupParts.Add("if (`$psRunAsCredential) { `$PSDefaultParameterValues['*-AD*:Credential'] = `$psRunAsCredential }")
-    }
 }
 
 if ($TranscriptPath) {
@@ -491,10 +483,10 @@ if ($NetOnly) {
     #    threads do NOT inherit a Win32 thread impersonation token, so mechanism #1
     #    alone is insufficient for AD cmdlets.  The credential script (dot-sourced
     #    so its variables land in the interactive session's scope) creates a
-    #    PSCredential named $psRunAsCredential.  When -Domain is specified, this is
-    #    also registered as the default -Credential for all AD cmdlets via
-    #    $PSDefaultParameterValues, ensuring every Get-ADUser / Get-ADGroup / etc.
-    #    call carries the explicit credential regardless of which thread handles I/O.
+    #    PSCredential named $psRunAsCredential.  This is registered as the default
+    #    -Credential for all AD cmdlets via $PSDefaultParameterValues, ensuring
+    #    every Get-ADUser / Get-ADGroup / etc. call carries the explicit credential
+    #    regardless of which thread handles I/O.
     #
     # Note: CredWrite(CRED_PERSIST_SESSION) cannot be used here.
     #    LOGON32_LOGON_NEW_CREDENTIALS (type 9) creates a "NewCredentials" logon
@@ -677,6 +669,16 @@ namespace PsRunAsInternal {
         # inside the script is placed in the interactive session's scope and persists
         # for the lifetime of the shell.  See comment in the script for details.
         $setupParts.Insert(0, ". '$netOnlyCredScriptEscaped'")
+        # Bind $psRunAsCredential as the default -Credential for all AD cmdlets so
+        # that async LDAP/ADWS operations on .NET thread-pool threads authenticate
+        # with the domain credential.  This applies whenever -NetOnly is active,
+        # regardless of whether -Domain was also supplied.
+        # Get-Variable is used instead of a bare $psRunAsCredential reference so
+        # that this line is safe even when the spawned session's profile has
+        # Set-StrictMode -Version Latest and the credential script failed silently
+        # (in which case $psRunAsCredential was never set and a bare reference would
+        # throw "The variable cannot be retrieved because it has not been set").
+        $setupParts.Add("if (Get-Variable -Name 'psRunAsCredential' -ValueOnly -ErrorAction SilentlyContinue) { `$PSDefaultParameterValues['*-AD*:Credential'] = `$psRunAsCredential }")
     } catch {
         Write-Warning ("Could not prepare credential registration script for the spawned " +
                        "session: $($_.Exception.Message). Network authentication (LDAP, " +
