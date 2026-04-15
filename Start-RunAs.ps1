@@ -636,8 +636,8 @@ namespace PsRunAsInternal {
         # PSDefaultParameterValues['*-AD*:Credential'].  This is more reliable than
         # Win32 thread impersonation because the AD module uses async LDAP/ADWS I/O
         # that runs on thread-pool threads which do NOT inherit the Win32 thread
-        # impersonation token.  $_sec.Copy() creates an independent SecureString so
-        # the credential remains valid after $_sec is disposed in the finally block
+        # impersonation token.  `$_sec.Copy() creates an independent SecureString so
+        # the credential remains valid after `$_sec is disposed in the finally block
         # below.  The variable name has no _ prefix so it is NOT removed by the
         # Remove-Variable cleanup at the end of this script — it stays in scope for
         # the lifetime of the interactive session.
