@@ -450,11 +450,30 @@ if ($NetOnly) {
     # session; recent Windows security updates broke that cache, but SSPI's
     # Credential Manager fallback still works when an entry is written from within
     # the spawned process (which runs in the new network logon session context).
-    # The password is protected with DPAPI so no plaintext appears on disk; the
-    # spawned session inherits the same local user token and decrypts with the
-    # same DPAPI key.
+    #
+    # Password transport: a random 256-bit AES key is generated here, used with
+    # ConvertFrom-SecureString -Key to encrypt the password (no DPAPI), and then
+    # the key and encrypted blob are both embedded in the temporary script.
+    # DPAPI (ConvertFrom-SecureString without -Key) cannot be used here because
+    # CreateProcessWithLogonW with LOGON_NETONLY does not load the user profile,
+    # so the DPAPI master keys in AppData\Roaming\Microsoft\Protect are
+    # inaccessible in the spawned process and decryption fails with
+    # "Error occurred during a cryptographic operation."
+    # The temp file is created with no special ACL (inherits TEMP directory
+    # permissions, typically accessible only to the current user on a well-
+    # configured system) and is deleted immediately after the spawned session
+    # reads it.
     try {
-        $encryptedPassword   = ConvertFrom-SecureString $Credential.Password
+        # Generate a random 256-bit AES key and encrypt the password with it.
+        $aesKey            = [byte[]]::new(32)
+        $rng               = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+        $rng.GetBytes($aesKey)
+        $rng.Dispose()
+        $encryptedPassword   = ConvertFrom-SecureString $Credential.Password -Key $aesKey
+        $aesKeyB64           = [System.Convert]::ToBase64String($aesKey)
+        # Zero the key bytes now that they have been embedded in the script string.
+        [System.Array]::Clear($aesKey, 0, $aesKey.Length)
+
         $credUserForScript   = $Credential.UserName.Replace("'", "''")
         $credTargetForScript = $credMgrTarget.Replace("'", "''")
         $netOnlyCredScript   = Join-Path ([System.IO.Path]::GetTempPath()) `
@@ -492,7 +511,9 @@ namespace PsRunAsInternal {
 }
 '@
     }
-    `$_sec = ConvertTo-SecureString '$encryptedPassword'
+    `$_key = [System.Convert]::FromBase64String('$aesKeyB64')
+    `$_sec = ConvertTo-SecureString '$encryptedPassword' -Key `$_key
+    [System.Array]::Clear(`$_key, 0, `$_key.Length)
     `$_ptr = [System.Runtime.InteropServices.Marshal]::SecureStringToGlobalAllocUnicode(`$_sec)
     try {
         `$_ce = New-Object PsRunAsInternal.CredMgr+CREDENTIAL
@@ -506,7 +527,7 @@ namespace PsRunAsInternal {
     } finally {
         [System.Runtime.InteropServices.Marshal]::ZeroFreeGlobalAllocUnicode(`$_ptr)
         `$_sec.Dispose()
-        Remove-Variable -Name '_ptr','_ce','_sec' -ErrorAction SilentlyContinue
+        Remove-Variable -Name '_ptr','_ce','_sec','_key' -ErrorAction SilentlyContinue
     }
 } catch {} finally {
     Remove-Item -LiteralPath `$PSCommandPath -Force -ErrorAction SilentlyContinue
