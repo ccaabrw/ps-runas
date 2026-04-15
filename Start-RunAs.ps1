@@ -561,6 +561,17 @@ namespace PsRunAsInternal {
         $credUser   = $Matches[2]
     }
 
+    # Derive the Windows Credential Manager target for the domain.
+    # For DOMAIN\user the target is the NETBIOS domain name; for UPN the
+    # target is the DNS domain portion (everything after the '@').
+    $credMgrTarget = if ($credDomain) {
+        $credDomain
+    } elseif ($credUser -match '@(.+)$') {
+        $Matches[1]
+    } else {
+        $credUser
+    }
+
     # Build a properly-quoted command line string for lpCommandLine.
     $quotedExe = '"' + $psExe.Replace('"', '""') + '"'
     if ($innerArgs) {
@@ -577,6 +588,76 @@ namespace PsRunAsInternal {
         $si    = New-Object PsRunAsInternal.Win32+STARTUPINFO
         $si.cb = [System.Runtime.InteropServices.Marshal]::SizeOf($si)
         $pi    = New-Object PsRunAsInternal.Win32+PROCESS_INFORMATION
+
+        # Register the credential in Windows Credential Manager (best-effort).
+        # Recent Windows security updates changed how LOGON_NETONLY stores
+        # network credentials in the Secondary Logon service, causing
+        # "Authentication failed, see inner exception." for any operation that
+        # requires network authentication in the spawned session (e.g. LDAP /
+        # Active Directory queries).  Storing a CRED_TYPE_DOMAIN_PASSWORD entry
+        # with CRED_PERSIST_SESSION persistence makes the credential available
+        # via the standard SSPI credential-lookup path so that both Kerberos and
+        # NTLM authentication succeed in the new window.  The entry is scoped to
+        # the current Windows logon session and is removed automatically when the
+        # user signs out.
+        try {
+            if (-not ('PsRunAsInternal.CredMgr' -as [type])) {
+                Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace PsRunAsInternal {
+    public static class CredMgr {
+        public const uint CRED_TYPE_DOMAIN_PASSWORD = 2;
+        public const uint CRED_PERSIST_SESSION      = 1;
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct CREDENTIAL {
+            public uint   Flags;
+            public uint   Type;
+            public string TargetName;
+            public string Comment;
+            public long   LastWritten;
+            public uint   CredentialBlobSize;
+            public IntPtr CredentialBlob;
+            public uint   Persist;
+            public uint   AttributeCount;
+            public IntPtr Attributes;
+            public string TargetAlias;
+            public string UserName;
+        }
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool CredWrite(ref CREDENTIAL userCredential, uint flags);
+    }
+}
+'@
+            }
+            $credEntry = New-Object PsRunAsInternal.CredMgr+CREDENTIAL
+            $credEntry.Type = [PsRunAsInternal.CredMgr]::CRED_TYPE_DOMAIN_PASSWORD
+            $credEntry.TargetName = $credMgrTarget
+            $credEntry.UserName = $Credential.UserName
+            $credEntry.Persist = [PsRunAsInternal.CredMgr]::CRED_PERSIST_SESSION
+            # CredentialBlob must be the password encoded as UTF-16LE bytes without a
+            # null terminator.  $passwordPtr was obtained from SecureStringToGlobalAllocUnicode,
+            # which produces exactly that layout followed by a null terminator; the
+            # null is excluded by limiting CredentialBlobSize to Password.Length * 2.
+            $credEntry.CredentialBlobSize = [uint32]($Credential.Password.Length * 2)
+            $credEntry.CredentialBlob = $passwordPtr
+            if (-not ([PsRunAsInternal.CredMgr]::CredWrite([ref]$credEntry, 0))) {
+                $credWriteErr = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                Write-Warning ("Could not register credentials in Windows Credential Manager " +
+                               "(Win32 error $credWriteErr). Network authentication in the new " +
+                               "session may fail on systems with recent Windows security updates " +
+                               "that changed Secondary Logon service credential handling.")
+            }
+        } catch {
+            Write-Warning ("Could not register credentials in Windows Credential Manager: " +
+                           "$($_.Exception.Message). Network authentication in the new session " +
+                           "may fail on systems with recent Windows security updates that changed " +
+                           "Secondary Logon service credential handling.")
+        }
 
         $ok = [PsRunAsInternal.Win32]::CreateProcessWithLogonW(
             $credUser, $credDomain, $passwordPtr,
@@ -625,9 +706,16 @@ namespace PsRunAsInternal {
         # non-MSIX PowerShell executables before surfacing the error to the user.
         # Check via the Win32 error code first (locale-independent), then fall back
         # to a message-string match for robustness across PowerShell versions.
+        # Recent Windows security updates can also cause Start-Process -Credential to
+        # throw System.Security.Authentication.AuthenticationException ("Authentication
+        # failed, see inner exception.") instead of Win32Exception 1326 for the same
+        # MSIX-related failure; include that exception type in the logon-failure check
+        # so the retry logic fires rather than immediately surfacing the error.
         $win32Ex = $_.Exception.InnerException -as [System.ComponentModel.Win32Exception]
         $isLogonFailure = ($win32Ex -and $win32Ex.NativeErrorCode -eq 1326) -or
-                          ($_.Exception.Message -like '*user name or password*')
+                          ($_.Exception.Message -like '*user name or password*') -or
+                          ($_.Exception     -is [System.Security.Authentication.AuthenticationException]) -or
+                          ($_.Exception.InnerException -is [System.Security.Authentication.AuthenticationException])
 
         if (-not $isLogonFailure) { throw }
 
@@ -652,13 +740,15 @@ namespace PsRunAsInternal {
                 $launched = $true
                 break
             } catch {
-                # Only suppress logon-failure errors (Win32 1326), which may indicate
-                # that this candidate is also MSIX-packaged.  Any other error is real
-                # (e.g. wrong credentials, logon type not permitted) and should be
-                # surfaced immediately rather than silently discarded.
+                # Only suppress logon-failure errors (Win32 1326 or AuthenticationException),
+                # which may indicate that this candidate is also MSIX-packaged.  Any other
+                # error is real (e.g. wrong credentials, logon type not permitted) and should
+                # be surfaced immediately rather than silently discarded.
                 $retryWin32Ex = $_.Exception.InnerException -as [System.ComponentModel.Win32Exception]
                 $isRetryLogonFailure = ($retryWin32Ex -and $retryWin32Ex.NativeErrorCode -eq 1326) -or
-                                       ($_.Exception.Message -like '*user name or password*')
+                                       ($_.Exception.Message -like '*user name or password*') -or
+                                       ($_.Exception     -is [System.Security.Authentication.AuthenticationException]) -or
+                                       ($_.Exception.InnerException -is [System.Security.Authentication.AuthenticationException])
                 if (-not $isRetryLogonFailure) { throw }
                 $lastCaughtError = $_
                 # Logon failure on this candidate; try the next one.
