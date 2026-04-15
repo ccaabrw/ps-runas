@@ -467,7 +467,7 @@ if ($NetOnly) {
     # Register the domain credential in the SPAWNED session so that Kerberos and
     # NTLM both work for AD queries, UNC paths, and other network operations.
     #
-    # Two complementary mechanisms are used:
+    # Two complementary mechanisms are used, in this order:
     #
     # 1. LogonUser(LOGON32_LOGON_NEW_CREDENTIALS) + ImpersonateLoggedOnUser
     #    This is the primary fix.  It creates a new LSA logon session that holds
@@ -480,7 +480,12 @@ if ($NetOnly) {
     # 2. CredWrite (CRED_TYPE_DOMAIN_PASSWORD / CRED_PERSIST_SESSION)
     #    Belt-and-suspenders: also writes the credential to Windows Credential
     #    Manager so that NTLM/SSPI fallback paths can find it via the standard
-    #    CredMan lookup.
+    #    CredMan lookup.  CredWrite MUST run after ImpersonateLoggedOnUser: the
+    #    process was started with CreateProcessWithLogonW(LOGON_NETONLY), whose
+    #    special logon session has no credential vault, causing CredWrite to fail
+    #    with Win32=1312 if called before impersonation.  After ImpersonateLoggedOnUser
+    #    the thread's logon-session LUID is the one created by LogonUser, which does
+    #    have a vault, so CredWrite succeeds.
     #
     # Password transport: a random 256-bit AES key is generated here, used with
     # ConvertFrom-SecureString -Key to encrypt the password (no DPAPI), and then
@@ -590,34 +595,27 @@ namespace PsRunAsInternal {
     [System.Array]::Clear(`$_key, 0, `$_key.Length)
     `$_ptr = [System.Runtime.InteropServices.Marshal]::SecureStringToGlobalAllocUnicode(`$_sec)
     try {
-        `$_ce = New-Object PsRunAsInternal.CredMgr+CREDENTIAL
-        `$_ce.Type              = [PsRunAsInternal.CredMgr]::CRED_TYPE_DOMAIN_PASSWORD
-        `$_ce.TargetName        = '$credTargetForScript'
-        `$_ce.UserName          = '$credUserForScript'
-        `$_ce.Persist           = [PsRunAsInternal.CredMgr]::CRED_PERSIST_SESSION
-        `$_ce.CredentialBlobSize = [uint32](`$_sec.Length * 2)
-        `$_ce.CredentialBlob    = `$_ptr
-        `$_credWriteOk  = [PsRunAsInternal.CredMgr]::CredWrite([ref]`$_ce, 0)
-        `$_w32eCredWrite = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
-        if (`$_diagEnabled) {
-            if (`$_credWriteOk) {
-                `$_diag.Add('  CredWrite: succeeded')
-            } else {
-                `$_diag.Add('  CredWrite: FAILED  Win32=' + `$_w32eCredWrite + '  ' + ([System.ComponentModel.Win32Exception]::new(`$_w32eCredWrite)).Message)
-            }
-        }
-        # Use LogonUser(LOGON32_LOGON_NEW_CREDENTIALS) + ImpersonateLoggedOnUser to
-        # install the domain credential directly into LSA on the main PowerShell
-        # thread.  This is more authoritative than CredWrite alone: Kerberos TGT
-        # requests are satisfied by the LSA logon session created here, so AD
-        # cmdlets (Get-ADUser, etc.) authenticate correctly even on systems where the
-        # Secondary Logon service's credential cache is broken by recent Windows
-        # security updates.  LOGON32_LOGON_NEW_CREDENTIALS does not contact the DC
-        # at logon time (credentials are validated only on first outbound use), so
-        # the call always succeeds as long as the parameters are well-formed.
-        # ImpersonateLoggedOnUser applies the new logon session to the current thread;
-        # RevertToSelf is intentionally not called so the session persists for the
-        # lifetime of the interactive shell.
+        # Step 1: LogonUser(LOGON32_LOGON_NEW_CREDENTIALS) + ImpersonateLoggedOnUser
+        # Install the domain credential directly into LSA on the main PowerShell
+        # thread.  Kerberos TGT requests are satisfied by the LSA logon session
+        # created here, so AD cmdlets (Get-ADUser, etc.) authenticate correctly even
+        # on systems where the Secondary Logon service's credential cache is broken by
+        # recent Windows security updates.  LOGON32_LOGON_NEW_CREDENTIALS does not
+        # contact the DC at logon time (credentials are validated only on first
+        # outbound use), so the call always succeeds as long as the parameters are
+        # well-formed.  ImpersonateLoggedOnUser applies the new logon session to the
+        # current thread; RevertToSelf is intentionally not called so the session
+        # persists for the lifetime of the interactive shell.
+        #
+        # IMPORTANT: LogonUser + ImpersonateLoggedOnUser must run BEFORE CredWrite.
+        # The process was started with CreateProcessWithLogonW(LOGON_NETONLY), which
+        # gives it a special "NewCredentials" logon session that has no credential
+        # vault.  CredWrite(CRED_PERSIST_SESSION) associates the entry with the
+        # calling thread's logon-session LUID; if called before impersonation it
+        # targets that vault-less session and fails with Win32=1312
+        # (ERROR_NO_SUCH_LOGON_SESSION).  After ImpersonateLoggedOnUser the thread
+        # LUID points to the proper logon session created by LogonUser, so CredWrite
+        # succeeds.
         `$_logonToken = [IntPtr]::Zero
         `$_logonOk    = [PsRunAsInternal.LogonHelper]::LogonUser(
                 '$credUserForLogon', $credDomainLogonArg, `$_ptr,
@@ -646,7 +644,29 @@ namespace PsRunAsInternal {
                     `$_diag.Add('  ImpersonateLoggedOnUser: FAILED  Win32=' + `$_w32eImpersonate + '  ' + ([System.ComponentModel.Win32Exception]::new(`$_w32eImpersonate)).Message)
                 }
             }
+            # ImpersonateLoggedOnUser has already duplicated the token internally;
+            # the original handle is no longer needed.
             [PsRunAsInternal.LogonHelper]::CloseHandle(`$_logonToken) | Out-Null
+        }
+        # Step 2: CredWrite (CRED_TYPE_DOMAIN_PASSWORD / CRED_PERSIST_SESSION)
+        # Belt-and-suspenders: also write the credential to Windows Credential
+        # Manager so that NTLM/SSPI fallback paths can find it via the standard
+        # CredMan lookup.  This must run after ImpersonateLoggedOnUser (see above).
+        `$_ce = New-Object PsRunAsInternal.CredMgr+CREDENTIAL
+        `$_ce.Type              = [PsRunAsInternal.CredMgr]::CRED_TYPE_DOMAIN_PASSWORD
+        `$_ce.TargetName        = '$credTargetForScript'
+        `$_ce.UserName          = '$credUserForScript'
+        `$_ce.Persist           = [PsRunAsInternal.CredMgr]::CRED_PERSIST_SESSION
+        `$_ce.CredentialBlobSize = [uint32](`$_sec.Length * 2)
+        `$_ce.CredentialBlob    = `$_ptr
+        `$_credWriteOk  = [PsRunAsInternal.CredMgr]::CredWrite([ref]`$_ce, 0)
+        `$_w32eCredWrite = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        if (`$_diagEnabled) {
+            if (`$_credWriteOk) {
+                `$_diag.Add('  CredWrite: succeeded')
+            } else {
+                `$_diag.Add('  CredWrite: FAILED  Win32=' + `$_w32eCredWrite + '  ' + ([System.ComponentModel.Win32Exception]::new(`$_w32eCredWrite)).Message)
+            }
         }
     } finally {
         [System.Runtime.InteropServices.Marshal]::ZeroFreeGlobalAllocUnicode(`$_ptr)
