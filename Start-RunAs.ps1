@@ -129,8 +129,8 @@
     The log records: timestamp, current user/domain, thread identity and impersonation level
     before any operations, the LogonUser username/domain arguments (never the password), the
     result of each P/Invoke call (LogonUser, ImpersonateLoggedOnUser) including the
-    Win32 error code and message on failure, thread identity after impersonation, and the full
-    exception chain if the startup block throws.
+    Win32 error code and message on failure, thread identity after impersonation, whether
+    $psRunAsCredential was created, and the full exception chain if the startup block throws.
 
     Usage example:
         .\Start-RunAs.ps1 -UserName "CONTOSO\AdminUser" -Domain "contoso.com" -Diagnostic
@@ -456,6 +456,14 @@ if ($Domain) {
     $domainEscaped = $Domain.Replace("'", "''")
     $setupParts.Add("`$PSDefaultParameterValues['*-AD*:Server'] = '$domainEscaped'")
     $setupParts.Add("`$PSDefaultParameterValues['*-Dns*:ComputerName'] = '$domainEscaped'")
+    if ($NetOnly) {
+        # When the credential script is dot-sourced it leaves $psRunAsCredential in
+        # scope.  Bind it as the default -Credential for all AD cmdlets so that
+        # async LDAP/ADWS operations (which do not inherit the Win32 thread
+        # impersonation token set by ImpersonateLoggedOnUser) still authenticate with
+        # the domain credential rather than falling back to the process identity.
+        $setupParts.Add("if (`$psRunAsCredential) { `$PSDefaultParameterValues['*-AD*:Credential'] = `$psRunAsCredential }")
+    }
 }
 
 if ($TranscriptPath) {
@@ -467,21 +475,33 @@ if ($NetOnly) {
     # Register the domain credential in the SPAWNED session so that Kerberos and
     # NTLM both work for AD queries, UNC paths, and other network operations.
     #
-    # LogonUser(LOGON32_LOGON_NEW_CREDENTIALS) + ImpersonateLoggedOnUser
+    # Two complementary mechanisms are used:
+    #
+    # 1. LogonUser(LOGON32_LOGON_NEW_CREDENTIALS) + ImpersonateLoggedOnUser
     #    Creates a new LSA logon session that holds the supplied credentials and
     #    makes the main PowerShell thread use it for all outbound network connections.
-    #    Kerberos TGT requests are satisfied by LSA from this logon session, so AD
-    #    cmdlets authenticate correctly even when the Secondary Logon service's
-    #    internal credential cache is broken by recent Windows security updates
-    #    (KB5034123, KB5034765 and related).
+    #    Kerberos TGT requests are satisfied by LSA from this logon session, so
+    #    synchronous operations on the calling thread authenticate correctly even when
+    #    the Secondary Logon service's credential cache is broken by recent Windows
+    #    security updates (KB5034123, KB5034765 and related).
+    #
+    # 2. $psRunAsCredential + $PSDefaultParameterValues['*-AD*:Credential']
+    #    The AD PowerShell module (Microsoft.ActiveDirectory.Management) uses
+    #    async LDAP/ADWS I/O that runs on .NET thread-pool threads.  Thread-pool
+    #    threads do NOT inherit a Win32 thread impersonation token, so mechanism #1
+    #    alone is insufficient for AD cmdlets.  The credential script (dot-sourced
+    #    so its variables land in the interactive session's scope) creates a
+    #    PSCredential named $psRunAsCredential.  When -Domain is specified, this is
+    #    also registered as the default -Credential for all AD cmdlets via
+    #    $PSDefaultParameterValues, ensuring every Get-ADUser / Get-ADGroup / etc.
+    #    call carries the explicit credential regardless of which thread handles I/O.
     #
     # Note: CredWrite(CRED_PERSIST_SESSION) cannot be used here.
     #    LOGON32_LOGON_NEW_CREDENTIALS (type 9) creates a "NewCredentials" logon
     #    session — a lightweight overlay designed only for outbound network credential
     #    substitution.  Windows does NOT associate a credential vault with this session
     #    LUID, so CredWrite always fails with Win32=1312 (ERROR_NO_SUCH_LOGON_SESSION)
-    #    regardless of when it is called.  The LogonUser + ImpersonateLoggedOnUser
-    #    path is the only mechanism that works reliably in LOGON_NETONLY context.
+    #    regardless of when it is called.
     #
     # Password transport: a random 256-bit AES key is generated here, used with
     # ConvertFrom-SecureString -Key to encrypt the password (no DPAPI), and then
@@ -506,6 +526,7 @@ if ($NetOnly) {
         # Zero the key bytes now that they have been embedded in the script string.
         [System.Array]::Clear($aesKey, 0, $aesKey.Length)
 
+        $credUserForScript   = $Credential.UserName.Replace("'", "''")
         # LogonUser takes the username and domain as separate strings.
         # For SAM format (DOMAIN\user), $credUser is already the bare username and
         # $credDomain is the NETBIOS domain name.  For UPN (user@domain.com),
@@ -610,6 +631,23 @@ namespace PsRunAsInternal {
             # the original handle is no longer needed.
             [PsRunAsInternal.LogonHelper]::CloseHandle(`$_logonToken) | Out-Null
         }
+        # Create a PSCredential in the calling (interactive session) scope so that
+        # AD cmdlets can receive the domain credential explicitly via
+        # PSDefaultParameterValues['*-AD*:Credential'].  This is more reliable than
+        # Win32 thread impersonation because the AD module uses async LDAP/ADWS I/O
+        # that runs on thread-pool threads which do NOT inherit the Win32 thread
+        # impersonation token.  $_sec.Copy() creates an independent SecureString so
+        # the credential remains valid after $_sec is disposed in the finally block
+        # below.  The variable name has no _ prefix so it is NOT removed by the
+        # Remove-Variable cleanup at the end of this script — it stays in scope for
+        # the lifetime of the interactive session.
+        # NOTE: this script must be dot-sourced (.) not called (&) for this variable
+        # to land in the interactive session's scope.
+        `$psRunAsCredential = New-Object System.Management.Automation.PSCredential(
+            '$credUserForScript', `$_sec.Copy())
+        if (`$_diagEnabled) {
+            `$_diag.Add('  psRunAsCredential: created for ' + `$psRunAsCredential.UserName)
+        }
     } finally {
         [System.Runtime.InteropServices.Marshal]::ZeroFreeGlobalAllocUnicode(`$_ptr)
         `$_sec.Dispose()
@@ -635,7 +673,10 @@ namespace PsRunAsInternal {
 }
 "@ | Set-Content -LiteralPath $netOnlyCredScript -Encoding UTF8
         $netOnlyCredScriptEscaped = $netOnlyCredScript.Replace("'", "''")
-        $setupParts.Insert(0, "& '$netOnlyCredScriptEscaped'")
+        # Dot-source (.) rather than call (&) so that $psRunAsCredential created
+        # inside the script is placed in the interactive session's scope and persists
+        # for the lifetime of the shell.  See comment in the script for details.
+        $setupParts.Insert(0, ". '$netOnlyCredScriptEscaped'")
     } catch {
         Write-Warning ("Could not prepare credential registration script for the spawned " +
                        "session: $($_.Exception.Message). Network authentication (LDAP, " +
