@@ -443,13 +443,23 @@ if ($TranscriptPath) {
 }
 
 if ($NetOnly) {
-    # Register the domain credential in the SPAWNED session's Windows Credential
-    # Manager so that SSPI finds it via the standard fallback lookup path.
-    # LOGON_NETONLY creates a separate network logon session (managed by the
-    # Secondary Logon service) whose credential cache is distinct from the calling
-    # session; recent Windows security updates broke that cache, but SSPI's
-    # Credential Manager fallback still works when an entry is written from within
-    # the spawned process (which runs in the new network logon session context).
+    # Register the domain credential in the SPAWNED session so that Kerberos and
+    # NTLM both work for AD queries, UNC paths, and other network operations.
+    #
+    # Two complementary mechanisms are used:
+    #
+    # 1. LogonUser(LOGON32_LOGON_NEW_CREDENTIALS) + ImpersonateLoggedOnUser
+    #    This is the primary fix.  It creates a new LSA logon session that holds
+    #    the supplied credentials and makes the main PowerShell thread use it for
+    #    all outbound network connections.  Kerberos TGT requests are satisfied
+    #    by LSA from this logon session, so AD cmdlets authenticate correctly even
+    #    when the Secondary Logon service's internal credential cache is broken by
+    #    recent Windows security updates (KB5034123, KB5034765 and related).
+    #
+    # 2. CredWrite (CRED_TYPE_DOMAIN_PASSWORD / CRED_PERSIST_SESSION)
+    #    Belt-and-suspenders: also writes the credential to Windows Credential
+    #    Manager so that NTLM/SSPI fallback paths can find it via the standard
+    #    CredMan lookup.
     #
     # Password transport: a random 256-bit AES key is generated here, used with
     # ConvertFrom-SecureString -Key to encrypt the password (no DPAPI), and then
@@ -476,6 +486,17 @@ if ($NetOnly) {
 
         $credUserForScript   = $Credential.UserName.Replace("'", "''")
         $credTargetForScript = $credMgrTarget.Replace("'", "''")
+        # LogonUser takes the username and domain as separate strings.
+        # For SAM format (DOMAIN\user), $credUser is already the bare username and
+        # $credDomain is the NETBIOS domain name.  For UPN (user@domain.com),
+        # $credDomain is null; LogonUser requires a null (not empty-string) domain in
+        # that case, so embed the PowerShell literal $null rather than ''.
+        $credUserForLogon   = $credUser.Replace("'", "''")
+        $credDomainLogonArg = if ($credDomain) {
+            "'" + $credDomain.Replace("'", "''") + "'"
+        } else {
+            '$null'
+        }
         $netOnlyCredScript   = Join-Path ([System.IO.Path]::GetTempPath()) `
                                    ([System.IO.Path]::ChangeExtension(
                                        [System.IO.Path]::GetRandomFileName(), 'ps1'))
@@ -508,6 +529,21 @@ namespace PsRunAsInternal {
         [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool CredWrite(ref CREDENTIAL c, uint flags);
     }
+    public static class LogonHelper {
+        public const int LOGON32_LOGON_NEW_CREDENTIALS = 9;
+        public const int LOGON32_PROVIDER_WINNT50      = 3;
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool LogonUser(
+            string lpszUsername, string lpszDomain, IntPtr lpszPassword,
+            int dwLogonType, int dwLogonProvider, out IntPtr phToken);
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool ImpersonateLoggedOnUser(IntPtr hToken);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool CloseHandle(IntPtr hObject);
+    }
 }
 '@
     }
@@ -524,10 +560,31 @@ namespace PsRunAsInternal {
         `$_ce.CredentialBlobSize = [uint32](`$_sec.Length * 2)
         `$_ce.CredentialBlob    = `$_ptr
         [PsRunAsInternal.CredMgr]::CredWrite([ref]`$_ce, 0) | Out-Null
+        # Use LogonUser(LOGON32_LOGON_NEW_CREDENTIALS) + ImpersonateLoggedOnUser to
+        # install the domain credential directly into LSA on the main PowerShell
+        # thread.  This is more authoritative than CredWrite alone: Kerberos TGT
+        # requests are satisfied by the LSA logon session created here, so AD
+        # cmdlets (Get-ADUser, etc.) authenticate correctly even on systems where the
+        # Secondary Logon service's credential cache is broken by recent Windows
+        # security updates.  LOGON32_LOGON_NEW_CREDENTIALS does not contact the DC
+        # at logon time (credentials are validated only on first outbound use), so
+        # the call always succeeds as long as the parameters are well-formed.
+        # ImpersonateLoggedOnUser applies the new logon session to the current thread;
+        # RevertToSelf is intentionally not called so the session persists for the
+        # lifetime of the interactive shell.
+        `$_logonToken = [IntPtr]::Zero
+        if ([PsRunAsInternal.LogonHelper]::LogonUser(
+                '$credUserForLogon', $credDomainLogonArg, `$_ptr,
+                [PsRunAsInternal.LogonHelper]::LOGON32_LOGON_NEW_CREDENTIALS,
+                [PsRunAsInternal.LogonHelper]::LOGON32_PROVIDER_WINNT50,
+                [ref]`$_logonToken) -and `$_logonToken -ne [IntPtr]::Zero) {
+            [PsRunAsInternal.LogonHelper]::ImpersonateLoggedOnUser(`$_logonToken) | Out-Null
+            [PsRunAsInternal.LogonHelper]::CloseHandle(`$_logonToken) | Out-Null
+        }
     } finally {
         [System.Runtime.InteropServices.Marshal]::ZeroFreeGlobalAllocUnicode(`$_ptr)
         `$_sec.Dispose()
-        Remove-Variable -Name '_ptr','_ce','_sec','_key' -ErrorAction SilentlyContinue
+        Remove-Variable -Name '_ptr','_ce','_sec','_key','_logonToken' -ErrorAction SilentlyContinue
     }
 } catch {} finally {
     Remove-Item -LiteralPath `$PSCommandPath -Force -ErrorAction SilentlyContinue
