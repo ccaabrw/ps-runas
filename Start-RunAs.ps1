@@ -302,10 +302,12 @@ if ($credUser -match '^([^\\]+)\\(.+)$') {
 # Derive the Windows Credential Manager target for the domain.
 # For DOMAIN\user the target is the NETBIOS domain name; for UPN the
 # target is the DNS domain portion (everything after the '@').
+$credUpnDomain = $null
 $credMgrTarget = if ($credDomain) {
     $credDomain
 } elseif ($credUser -match '@(.+)$') {
-    $Matches[1]
+    $credUpnDomain = $Matches[1]
+    $credUpnDomain
 } else {
     $credUser
 }
@@ -540,6 +542,11 @@ if ($NetOnly) {
         } else {
             '$null'
         }
+        # Plain-text version of the domain for embedding in the diagnostic log line.
+        # $credDomainLogonArg includes surrounding single-quote syntax decorations for
+        # NETBIOS names ('CONTOSO'); those quotes would break the single-quoted string
+        # in the generated .Add() call.  This variable holds only the bare value.
+        $credDomainDisplay  = if ($credDomain) { $credDomain.Replace("'", "''") } else { '$null' }
         # Bake the diagnostic flag into the generated script as a literal so no
         # parameter passing is needed across the process boundary.
         $diagEnabledLiteral  = if ($Diagnostic) { '$true' } else { '$false' }
@@ -559,7 +566,7 @@ if (`$_diagEnabled) {
     `$_diag.Add('  identity (before)             = ' + `$_id.Name)
     `$_diag.Add('  impersonation level (before)  = ' + `$_id.ImpersonationLevel)
     `$_id.Dispose()
-    `$_diag.Add('  LogonUser args: username=$credUserForLogon  domain=$credDomainLogonArg')
+    `$_diag.Add('  LogonUser args: username=$credUserForLogon  domain=$credDomainDisplay')
 }
 try {
     if (-not ('PsRunAsInternal.LogonHelper' -as [type])) {
@@ -701,8 +708,10 @@ namespace PsRunAsInternal {
         # Active Directory Web Services running" when the machine is not joined to the
         # target domain.  This mirrors what -Domain does but is derived automatically
         # so the user does not have to specify -Domain separately when using a UPN.
-        if (-not $Domain -and -not $credDomain -and $credUser -match '@(.+)$') {
-            $autoServerEscaped = $Matches[1].Replace("'", "''")
+        # $credUpnDomain is null for SAM (DOMAIN\user) credentials, so this block
+        # only fires for UPN format.
+        if (-not $Domain -and $credUpnDomain) {
+            $autoServerEscaped = $credUpnDomain.Replace("'", "''")
             $setupParts.Add("`$PSDefaultParameterValues['*-AD*:Server'] = '$autoServerEscaped'")
             $setupParts.Add("`$PSDefaultParameterValues['*-Dns*:ComputerName'] = '$autoServerEscaped'")
         }
