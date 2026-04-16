@@ -130,7 +130,9 @@
     before any operations, the LogonUser username/domain arguments (never the password), the
     result of each P/Invoke call (LogonUser, ImpersonateLoggedOnUser) including the
     Win32 error code and message on failure, thread identity after impersonation, whether
-    $psRunAsCredential was created, and the full exception chain if the startup block throws.
+    $psRunAsCredential was created, the full exception chain if the startup block throws,
+    and — appended after all setup runs — the final values of
+    $PSDefaultParameterValues['*-AD*:Server'] and $PSDefaultParameterValues['*-AD*:Credential'].
 
     Usage example:
         .\Start-RunAs.ps1 -UserName "CONTOSO\AdminUser" -Domain "contoso.com" -Diagnostic
@@ -477,7 +479,7 @@ if ($NetOnly) {
     #    the Secondary Logon service's credential cache is broken by recent Windows
     #    security updates (KB5034123, KB5034765 and related).
     #
-    # 2. $psRunAsCredential + $PSDefaultParameterValues['*-AD*:Credential']
+    # 2. $psRunAsCredential + $PSDefaultParameterValues['*-AD*:Credential'] + ['*-AD*:Server']
     #    The AD PowerShell module (Microsoft.ActiveDirectory.Management) uses
     #    async LDAP/ADWS I/O that runs on .NET thread-pool threads.  Thread-pool
     #    threads do NOT inherit a Win32 thread impersonation token, so mechanism #1
@@ -487,6 +489,14 @@ if ($NetOnly) {
     #    -Credential for all AD cmdlets via $PSDefaultParameterValues, ensuring
     #    every Get-ADUser / Get-ADGroup / etc. call carries the explicit credential
     #    regardless of which thread handles I/O.
+    #
+    #    When the credential is in UPN format and -Domain was not explicitly provided,
+    #    the domain portion of the UPN (e.g. ad.ucl.ac.uk from user@ad.ucl.ac.uk) is
+    #    also registered as $PSDefaultParameterValues['*-AD*:Server'].  Without this
+    #    the AD module tries to discover a DC for the local machine's domain rather than
+    #    the target domain, which fails with "Unable to find a default server with
+    #    Active Directory Web Services running" when the machine is not joined to the
+    #    target domain.
     #
     # Note: CredWrite(CRED_PERSIST_SESSION) cannot be used here.
     #    LOGON32_LOGON_NEW_CREDENTIALS (type 9) creates a "NewCredentials" logon
@@ -658,6 +668,10 @@ namespace PsRunAsInternal {
     if (`$_diagEnabled -and `$_diagLog) {
         `$_diag | Set-Content -LiteralPath `$_diagLog -Encoding UTF8
         Write-Host ('[Start-RunAs] Credential startup log: ' + `$_diagLog) -ForegroundColor Yellow
+        # Expose the log path in a session-scoped variable (no _ prefix, so it is NOT
+        # removed by the cleanup below) so that the post-setup diagnostic step in the
+        # injected -Command line can append the final PSDefaultParameterValues state.
+        `$psRunAsDiagLog = `$_diagLog
     }
     # Clean up all script-private variables (all use the _ prefix).
     Get-Variable -Name '_*' -Scope Local -ErrorAction SilentlyContinue | Remove-Variable -ErrorAction SilentlyContinue
@@ -679,6 +693,35 @@ namespace PsRunAsInternal {
         # (in which case $psRunAsCredential was never set and a bare reference would
         # throw "The variable cannot be retrieved because it has not been set").
         $setupParts.Add("if (Get-Variable -Name 'psRunAsCredential' -ValueOnly -ErrorAction SilentlyContinue) { `$PSDefaultParameterValues['*-AD*:Credential'] = `$psRunAsCredential }")
+        # When -Domain was not specified but the credential is in UPN format
+        # (e.g. user@ad.contoso.com), automatically set the AD/DNS server default to
+        # the domain portion of the UPN.  Without a server hint the AD module tries to
+        # discover a DC for the local machine's domain (DRACO in the diagnostic logs,
+        # not ad.ucl.ac.uk), which fails with "Unable to find a default server with
+        # Active Directory Web Services running" when the machine is not joined to the
+        # target domain.  This mirrors what -Domain does but is derived automatically
+        # so the user does not have to specify -Domain separately when using a UPN.
+        if (-not $Domain -and -not $credDomain -and $credUser -match '@(.+)$') {
+            $autoServerEscaped = $Matches[1].Replace("'", "''")
+            $setupParts.Add("`$PSDefaultParameterValues['*-AD*:Server'] = '$autoServerEscaped'")
+            $setupParts.Add("`$PSDefaultParameterValues['*-Dns*:ComputerName'] = '$autoServerEscaped'")
+        }
+        # When -Diagnostic was specified, append the final PSDefaultParameterValues state
+        # to the log file written by the credential startup script.  This captures what
+        # was actually set for *-AD*:Server and *-AD*:Credential so the full chain from
+        # LogonUser through PSDefaultParameterValues is visible in a single log.
+        # $psRunAsDiagLog is exposed by the credential script's finally block; it is
+        # only set when -Diagnostic is active, so this block is a no-op otherwise.
+        $setupParts.Add(
+            "if (Get-Variable -Name 'psRunAsDiagLog' -ValueOnly -ErrorAction SilentlyContinue) { " +
+            "`$__s = `$PSDefaultParameterValues['*-AD*:Server']; " +
+            "`$__c = `$PSDefaultParameterValues['*-AD*:Credential']; " +
+            "`$__cv = if (`$__c) { '<PSCredential:' + `$__c.UserName + '>' } else { '(not set)' }; " +
+            "Add-Content -LiteralPath `$psRunAsDiagLog -Encoding UTF8 " +
+            "-Value @('  [post-setup] PSDefaultParameterValues[*-AD*:Server]     = ' + (if (`$__s) { `$__s } else { '(not set)' }), " +
+            "         '  [post-setup] PSDefaultParameterValues[*-AD*:Credential] = ' + `$__cv); " +
+            "Remove-Variable -Name '__s','__c','__cv' -ErrorAction SilentlyContinue }"
+        )
     } catch {
         Write-Warning ("Could not prepare credential registration script for the spawned " +
                        "session: $($_.Exception.Message). Network authentication (LDAP, " +
