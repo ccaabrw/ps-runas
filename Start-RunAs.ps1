@@ -568,6 +568,9 @@ if ($NetOnly) {
         # empty in that case and the credential script skips the assignment.
         $autoServerBlock = if (-not $Domain -and $credUpnDomain) {
             $s = $credUpnDomain.Replace("'", "''")
+            # *-AD*:Server targets the ADWS endpoint for AD cmdlets (Get-ADUser, etc.).
+            # *-Dns*:ComputerName targets the DNS server for Resolve-DnsName and related
+            # cmdlets — useful when querying SRV/A records for the same domain.
             "`$PSDefaultParameterValues['*-AD*:Server'] = '$s'`n`$PSDefaultParameterValues['*-Dns*:ComputerName'] = '$s'"
         } else { '' }
 
