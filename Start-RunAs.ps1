@@ -306,8 +306,7 @@ $credUpnDomain = $null
 $credMgrTarget = if ($credDomain) {
     $credDomain
 } elseif ($credUser -match '@(.+)$') {
-    $credUpnDomain = $Matches[1]
-    $credUpnDomain
+    ($credUpnDomain = $Matches[1])   # parens emit the value so $credMgrTarget is set
 } else {
     $credUser
 }
@@ -546,6 +545,9 @@ if ($NetOnly) {
         # $credDomainLogonArg includes surrounding single-quote syntax decorations for
         # NETBIOS names ('CONTOSO'); those quotes would break the single-quoted string
         # in the generated .Add() call.  This variable holds only the bare value.
+        # '$null' (the literal text) is kept for the UPN/null case so the log entry
+        # matches the PowerShell argument syntax actually passed to LogonUser, which
+        # was the original diagnostic format and is recognisable to readers.
         $credDomainDisplay  = if ($credDomain) { $credDomain.Replace("'", "''") } else { '$null' }
         # Bake the diagnostic flag into the generated script as a literal so no
         # parameter passing is needed across the process boundary.
@@ -553,6 +555,13 @@ if ($NetOnly) {
         $netOnlyCredScript   = Join-Path ([System.IO.Path]::GetTempPath()) `
                                    ([System.IO.Path]::ChangeExtension(
                                        [System.IO.Path]::GetRandomFileName(), 'ps1'))
+        # NOTE: In this @"..."@ here-string, variables WITHOUT a leading backtick
+        # ($credUserForLogon, $credDomainDisplay, $diagEnabledLiteral, $aesKeyB64,
+        # $encryptedPassword, $credDomainLogonArg) are expanded by the OUTER script
+        # and their values are baked into the generated credential startup script.
+        # Variables WITH a leading backtick (`$_diag, `$_sec, etc.) are NOT expanded
+        # here; they become literal $-prefixed names in the generated script that run
+        # in the spawned session.
         @"
 `$_diagEnabled = $diagEnabledLiteral
 `$_diagLog     = `$null
