@@ -831,7 +831,8 @@ if ($setupLine) {
 # password" error even when the supplied credentials are correct.
 # Therefore the script always launches the PowerShell executable directly with
 # -Credential, regardless of whether wt.exe is present on the system.
-$wtExe = (Get-Command 'wt.exe' -ErrorAction SilentlyContinue)?.Source
+$wtCmd = Get-Command 'wt.exe' -ErrorAction SilentlyContinue
+$wtExe = if ($wtCmd) { $wtCmd.Source } else { $null }
 
 if ($wtExe) {
     Write-Warning "Windows Terminal (wt.exe) cannot be started as a different user because it is an MSIX-packaged application. Falling back to a plain PowerShell window."
