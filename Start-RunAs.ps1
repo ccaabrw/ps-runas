@@ -560,10 +560,22 @@ if ($NetOnly) {
         $netOnlyCredScript   = Join-Path ([System.IO.Path]::GetTempPath()) `
                                    ([System.IO.Path]::ChangeExtension(
                                        [System.IO.Path]::GetRandomFileName(), 'ps1'))
+        # Pre-compute the server auto-inject block for UPN credentials without -Domain.
+        # The block is embedded directly in the credential script (below) rather than
+        # as an extra $setupParts element so that the total lpCommandLine passed to
+        # CreateProcessWithLogonW stays under its documented 1024-character limit.
+        # $credUpnDomain is null for SAM (DOMAIN\user) credentials; the block is
+        # empty in that case and the credential script skips the assignment.
+        $autoServerBlock = if (-not $Domain -and $credUpnDomain) {
+            $s = $credUpnDomain.Replace("'", "''")
+            "`$PSDefaultParameterValues['*-AD*:Server'] = '$s'`n`$PSDefaultParameterValues['*-Dns*:ComputerName'] = '$s'"
+        } else { '' }
+
         # NOTE: In this @"..."@ here-string, variables WITHOUT a leading backtick
         # ($credUserForLogon, $credDomainDisplay, $diagEnabledLiteral, $aesKeyB64,
-        # $encryptedPassword, $credDomainLogonArg) are expanded by the OUTER script
-        # and their values are baked into the generated credential startup script.
+        # $encryptedPassword, $credDomainLogonArg, $autoServerBlock) are expanded by
+        # the OUTER script and their values are baked into the generated credential
+        # startup script.
         # Variables WITH a leading backtick (`$_diag, `$_sec, etc.) are NOT expanded
         # here; they become literal $-prefixed names in the generated script that run
         # in the spawned session.
@@ -691,66 +703,50 @@ namespace PsRunAsInternal {
         `$_diag | Set-Content -LiteralPath `$_diagLog -Encoding UTF8
         Write-Host ('[Start-RunAs] Credential startup log: ' + `$_diagLog) -ForegroundColor Yellow
         # Expose the log path in a session-scoped variable (no _ prefix, so it is NOT
-        # removed by the cleanup below) so that the post-setup diagnostic step in the
-        # injected -Command line can append the final PSDefaultParameterValues state.
+        # removed by the cleanup below) so that the post-setup diagnostic step in this
+        # script can append the final PSDefaultParameterValues state.
         `$psRunAsDiagLog = `$_diagLog
     }
     # Clean up all script-private variables (all use the _ prefix).
     Get-Variable -Name '_*' -Scope Local -ErrorAction SilentlyContinue | Remove-Variable -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath `$PSCommandPath -Force -ErrorAction SilentlyContinue
 }
+# Configure PSDefaultParameterValues with the domain credential and target server.
+# These run after the try/catch/finally block so that `$psRunAsCredential and
+# `$psRunAsDiagLog are already set.  Get-Variable with -ErrorAction SilentlyContinue
+# avoids breaking sessions where Set-StrictMode -Version Latest is active and the
+# credential script failed (leaving `$psRunAsCredential unset).
+if (Get-Variable -Name 'psRunAsCredential' -ValueOnly -ErrorAction SilentlyContinue) {
+    `$PSDefaultParameterValues['*-AD*:Credential'] = `$psRunAsCredential
+}
+$autoServerBlock
+# Post-setup diagnostic: print AD config to the spawned console and append to log.
+# The if-guard is a no-op when -Diagnostic was not specified (psRunAsDiagLog is not set).
+if (Get-Variable -Name 'psRunAsDiagLog' -ValueOnly -ErrorAction SilentlyContinue) {
+    `$__s  = `$PSDefaultParameterValues['*-AD*:Server']
+    `$__c  = `$PSDefaultParameterValues['*-AD*:Credential']
+    `$__sv = if (`$__s) { `$__s } else { '(not set)' }
+    `$__cv = if (`$__c) { '<PSCredential:' + `$__c.UserName + '>' } else { '(not set)' }
+    Write-Host ('[Start-RunAs][post-setup] *-AD*:Server     = ' + `$__sv) -ForegroundColor Yellow
+    Write-Host ('[Start-RunAs][post-setup] *-AD*:Credential = ' + `$__cv) -ForegroundColor Yellow
+    try {
+        Add-Content -LiteralPath `$psRunAsDiagLog -Encoding UTF8 -Value @(
+            '  [post-setup] PSDefaultParameterValues[*-AD*:Server]     = ' + `$__sv,
+            '  [post-setup] PSDefaultParameterValues[*-AD*:Credential] = ' + `$__cv)
+    } catch {
+        Write-Warning ('[Start-RunAs] Could not append post-setup state to log: ' + `$_.Exception.Message)
+    }
+    Remove-Variable -Name '__s','__c','__sv','__cv' -ErrorAction SilentlyContinue
+}
 "@ | Set-Content -LiteralPath $netOnlyCredScript -Encoding UTF8
         $netOnlyCredScriptEscaped = $netOnlyCredScript.Replace("'", "''")
-        # Dot-source (.) rather than call (&) so that $psRunAsCredential created
-        # inside the script is placed in the interactive session's scope and persists
-        # for the lifetime of the shell.  See comment in the script for details.
+        # Dot-source (.) rather than call (&) so that $psRunAsCredential,
+        # $PSDefaultParameterValues, and any other variables created inside the
+        # script are placed in the interactive session's scope and persist for
+        # the lifetime of the shell.  All setup (credential binding, AD server
+        # defaults, post-setup diagnostic output) is embedded in the script so
+        # that $cmdLine stays well under CreateProcessWithLogonW's 1024-char limit.
         $setupParts.Insert(0, ". '$netOnlyCredScriptEscaped'")
-        # Bind $psRunAsCredential as the default -Credential for all AD cmdlets so
-        # that async LDAP/ADWS operations on .NET thread-pool threads authenticate
-        # with the domain credential.  This applies whenever -NetOnly is active,
-        # regardless of whether -Domain was also supplied.
-        # Get-Variable is used instead of a bare $psRunAsCredential reference so
-        # that this line is safe even when the spawned session's profile has
-        # Set-StrictMode -Version Latest and the credential script failed silently
-        # (in which case $psRunAsCredential was never set and a bare reference would
-        # throw "The variable cannot be retrieved because it has not been set").
-        $setupParts.Add("if (Get-Variable -Name 'psRunAsCredential' -ValueOnly -ErrorAction SilentlyContinue) { `$PSDefaultParameterValues['*-AD*:Credential'] = `$psRunAsCredential }")
-        # When -Domain was not specified but the credential is in UPN format
-        # (e.g. user@ad.contoso.com), automatically set the AD/DNS server default to
-        # the domain portion of the UPN.  Without a server hint the AD module tries to
-        # discover a DC for the local machine's domain (DRACO in the diagnostic logs,
-        # not ad.ucl.ac.uk), which fails with "Unable to find a default server with
-        # Active Directory Web Services running" when the machine is not joined to the
-        # target domain.  This mirrors what -Domain does but is derived automatically
-        # so the user does not have to specify -Domain separately when using a UPN.
-        # $credUpnDomain is null for SAM (DOMAIN\user) credentials, so this block
-        # only fires for UPN format.
-        if (-not $Domain -and $credUpnDomain) {
-            $autoServerEscaped = $credUpnDomain.Replace("'", "''")
-            $setupParts.Add("`$PSDefaultParameterValues['*-AD*:Server'] = '$autoServerEscaped'")
-            $setupParts.Add("`$PSDefaultParameterValues['*-Dns*:ComputerName'] = '$autoServerEscaped'")
-        }
-        # When -Diagnostic was specified, print the final PSDefaultParameterValues state
-        # to the spawned console (Write-Host) AND append it to the log file (Add-Content).
-        # Write-Host is the primary channel: it is always visible in the window and does
-        # not depend on file-system access.  Add-Content is secondary (best-effort, wrapped
-        # in try/catch so a write failure becomes a visible warning rather than silent loss).
-        # $psRunAsDiagLog is exposed by the credential script's finally block; it is
-        # only set when -Diagnostic is active, so this block is a no-op otherwise.
-        $setupParts.Add(
-            "if (Get-Variable -Name 'psRunAsDiagLog' -ValueOnly -ErrorAction SilentlyContinue) { " +
-            "`$__s  = `$PSDefaultParameterValues['*-AD*:Server']; " +
-            "`$__c  = `$PSDefaultParameterValues['*-AD*:Credential']; " +
-            "`$__sv = if (`$__s) { `$__s } else { '(not set)' }; " +
-            "`$__cv = if (`$__c) { '<PSCredential:' + `$__c.UserName + '>' } else { '(not set)' }; " +
-            "Write-Host ('[Start-RunAs][post-setup] *-AD*:Server     = ' + `$__sv) -ForegroundColor Yellow; " +
-            "Write-Host ('[Start-RunAs][post-setup] *-AD*:Credential = ' + `$__cv) -ForegroundColor Yellow; " +
-            "try { Add-Content -LiteralPath `$psRunAsDiagLog -Encoding UTF8 " +
-            "-Value @('  [post-setup] PSDefaultParameterValues[*-AD*:Server]     = ' + `$__sv, " +
-            "         '  [post-setup] PSDefaultParameterValues[*-AD*:Credential] = ' + `$__cv) } " +
-            "catch { Write-Warning ('[Start-RunAs] Could not append post-setup state to log: ' + `$_.Exception.Message) }; " +
-            "Remove-Variable -Name '__s','__c','__sv','__cv' -ErrorAction SilentlyContinue }" # matches $__s, $__c, $__sv, $__cv above
-        )
     } catch {
         Write-Warning ("Could not prepare credential registration script for the spawned " +
                        "session: $($_.Exception.Message). Network authentication (LDAP, " +
