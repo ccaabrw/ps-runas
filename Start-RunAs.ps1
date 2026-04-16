@@ -134,6 +134,9 @@
     and — appended after all setup runs — the final values of
     $PSDefaultParameterValues['*-AD*:Server'] and $PSDefaultParameterValues['*-AD*:Credential'].
 
+    The post-setup values are also printed directly to the spawned console window (in yellow)
+    so they are immediately visible without opening the log file.
+
     Usage example:
         .\Start-RunAs.ps1 -UserName "CONTOSO\AdminUser" -Domain "contoso.com" -Diagnostic
     Then in the spawned window:
@@ -571,6 +574,7 @@ if ($NetOnly) {
 if (`$_diagEnabled) {
     `$_diagLog = [System.IO.Path]::Combine(`$env:TEMP, ('Start-RunAs-diag-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.log'))
     `$_diag.Add('[' + (Get-Date -Format 'o') + '] Start-RunAs credential startup diagnostic')
+    `$_diag.Add('  start-runas-build : 20260416-fix-netonly-auto-server')
     `$_diag.Add('  env:USERNAME   = ' + `$env:USERNAME)
     `$_diag.Add('  env:USERDOMAIN = ' + `$env:USERDOMAIN)
     `$_id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
@@ -726,21 +730,26 @@ namespace PsRunAsInternal {
             $setupParts.Add("`$PSDefaultParameterValues['*-AD*:Server'] = '$autoServerEscaped'")
             $setupParts.Add("`$PSDefaultParameterValues['*-Dns*:ComputerName'] = '$autoServerEscaped'")
         }
-        # When -Diagnostic was specified, append the final PSDefaultParameterValues state
-        # to the log file written by the credential startup script.  This captures what
-        # was actually set for *-AD*:Server and *-AD*:Credential so the full chain from
-        # LogonUser through PSDefaultParameterValues is visible in a single log.
+        # When -Diagnostic was specified, print the final PSDefaultParameterValues state
+        # to the spawned console (Write-Host) AND append it to the log file (Add-Content).
+        # Write-Host is the primary channel: it is always visible in the window and does
+        # not depend on file-system access.  Add-Content is secondary (best-effort, wrapped
+        # in try/catch so a write failure becomes a visible warning rather than silent loss).
         # $psRunAsDiagLog is exposed by the credential script's finally block; it is
         # only set when -Diagnostic is active, so this block is a no-op otherwise.
         $setupParts.Add(
             "if (Get-Variable -Name 'psRunAsDiagLog' -ValueOnly -ErrorAction SilentlyContinue) { " +
-            "`$__s = `$PSDefaultParameterValues['*-AD*:Server']; " +
-            "`$__c = `$PSDefaultParameterValues['*-AD*:Credential']; " +
+            "`$__s  = `$PSDefaultParameterValues['*-AD*:Server']; " +
+            "`$__c  = `$PSDefaultParameterValues['*-AD*:Credential']; " +
+            "`$__sv = if (`$__s) { `$__s } else { '(not set)' }; " +
             "`$__cv = if (`$__c) { '<PSCredential:' + `$__c.UserName + '>' } else { '(not set)' }; " +
-            "Add-Content -LiteralPath `$psRunAsDiagLog -Encoding UTF8 " +
-            "-Value @('  [post-setup] PSDefaultParameterValues[*-AD*:Server]     = ' + (if (`$__s) { `$__s } else { '(not set)' }), " +
-            "         '  [post-setup] PSDefaultParameterValues[*-AD*:Credential] = ' + `$__cv); " +
-            "Remove-Variable -Name '__s','__c','__cv' -ErrorAction SilentlyContinue }"
+            "Write-Host ('[Start-RunAs][post-setup] *-AD*:Server     = ' + `$__sv) -ForegroundColor Yellow; " +
+            "Write-Host ('[Start-RunAs][post-setup] *-AD*:Credential = ' + `$__cv) -ForegroundColor Yellow; " +
+            "try { Add-Content -LiteralPath `$psRunAsDiagLog -Encoding UTF8 " +
+            "-Value @('  [post-setup] PSDefaultParameterValues[*-AD*:Server]     = ' + `$__sv, " +
+            "         '  [post-setup] PSDefaultParameterValues[*-AD*:Credential] = ' + `$__cv) } " +
+            "catch { Write-Warning ('[Start-RunAs] Could not append post-setup state to log: ' + `$_.Exception.Message) }; " +
+            "Remove-Variable -Name '__s','__c','__sv','__cv' -ErrorAction SilentlyContinue }"
         )
     } catch {
         Write-Warning ("Could not prepare credential registration script for the spawned " +
