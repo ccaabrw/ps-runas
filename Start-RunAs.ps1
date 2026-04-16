@@ -306,7 +306,8 @@ $credUpnDomain = $null
 $credMgrTarget = if ($credDomain) {
     $credDomain
 } elseif ($credUser -match '@(.+)$') {
-    ($credUpnDomain = $Matches[1])   # parens emit the value so $credMgrTarget is set
+    $credUpnDomain = $Matches[1]
+    $credUpnDomain
 } else {
     $credUser
 }
@@ -545,9 +546,10 @@ if ($NetOnly) {
         # $credDomainLogonArg includes surrounding single-quote syntax decorations for
         # NETBIOS names ('CONTOSO'); those quotes would break the single-quoted string
         # in the generated .Add() call.  This variable holds only the bare value.
-        # '$null' (the literal text) is kept for the UPN/null case so the log entry
-        # matches the PowerShell argument syntax actually passed to LogonUser, which
-        # was the original diagnostic format and is recognisable to readers.
+        # '$null' (the literal text with a dollar sign) is used for the UPN/no-domain
+        # case to match the PowerShell $null syntax that is actually passed as the
+        # lpszDomain argument to LogonUser, keeping the diagnostic log consistent with
+        # what was passed to the Win32 API.
         $credDomainDisplay  = if ($credDomain) { $credDomain.Replace("'", "''") } else { '$null' }
         # Bake the diagnostic flag into the generated script as a literal so no
         # parameter passing is needed across the process boundary.
