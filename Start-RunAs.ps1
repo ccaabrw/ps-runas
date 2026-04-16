@@ -121,6 +121,29 @@
     When -Domain is specified, -NetOnly is enabled automatically unless -NetOnly:$false is
     passed explicitly.
 
+.PARAMETER Diagnostic
+    When specified together with -NetOnly, the spawned session's credential-registration
+    startup script writes a structured diagnostic log to a file in $env:TEMP named
+    Start-RunAs-diag-<timestamp>.log and prints the path to the spawned console at startup.
+
+    The log records: timestamp, current user/domain, thread identity and impersonation level
+    before any operations, the LogonUser username/domain arguments (never the password), the
+    result of each P/Invoke call (LogonUser, ImpersonateLoggedOnUser) including the
+    Win32 error code and message on failure, thread identity after impersonation, whether
+    $psRunAsCredential was created, the full exception chain if the startup block throws,
+    and — appended after all setup runs — the final values of
+    $PSDefaultParameterValues['*-AD*:Server'] and $PSDefaultParameterValues['*-AD*:Credential'].
+
+    The post-setup values are also printed directly to the spawned console window (in yellow)
+    so they are immediately visible without opening the log file.
+
+    Usage example:
+        .\Start-RunAs.ps1 -UserName "CONTOSO\AdminUser" -Domain "contoso.com" -Diagnostic
+    Then in the spawned window:
+        Get-Content $env:TEMP\Start-RunAs-diag-*.log
+
+    This parameter has no effect when -NetOnly is not active.
+
 .EXAMPLE
     .\Start-RunAs.ps1 -UserName "CONTOSO\AdminUser"
 
@@ -196,6 +219,9 @@ param (
     [switch] $NetOnly,
 
     [Parameter()]
+    [switch] $Diagnostic,
+
+    [Parameter()]
     [string] $Domain,
 
     [Parameter()]
@@ -256,6 +282,37 @@ if (-not $Credential) {
 # restriction.  The caller can opt out by passing -NetOnly:$false explicitly.
 if ($Domain -and -not $PSBoundParameters.ContainsKey('NetOnly')) {
     $NetOnly = $true
+}
+
+#endregion
+
+#region --- Derive credential components ------------------------------------
+
+# Split the credential username into the parts expected by
+# CreateProcessWithLogonW.  Done early so the values are available when
+# building $setupParts (for spawned-session credential registration) as
+# well as in the NetOnly launch block.
+# For UPN format (user@domain) pass the full UPN as lpUsername with a null
+# lpDomain, as documented by the API; for DOMAIN\user format split into the
+# two components.
+$credUser   = $Credential.UserName
+$credDomain = $null
+if ($credUser -match '^([^\\]+)\\(.+)$') {
+    $credDomain = $Matches[1]
+    $credUser   = $Matches[2]
+}
+
+# Derive the Windows Credential Manager target for the domain.
+# For DOMAIN\user the target is the NETBIOS domain name; for UPN the
+# target is the DNS domain portion (everything after the '@').
+$credUpnDomain = $null
+$credMgrTarget = if ($credDomain) {
+    $credDomain
+} elseif ($credUser -match '@(.+)$') {
+    $credUpnDomain = $Matches[1]
+    $credUpnDomain
+} else {
+    $credUser
 }
 
 #endregion
@@ -413,6 +470,294 @@ if ($TranscriptPath) {
     $setupParts.Add("Start-Transcript -Path '$transcriptEscaped' -Append")
 }
 
+if ($NetOnly) {
+    # Register the domain credential in the SPAWNED session so that Kerberos and
+    # NTLM both work for AD queries, UNC paths, and other network operations.
+    #
+    # Two complementary mechanisms are used:
+    #
+    # 1. LogonUser(LOGON32_LOGON_NEW_CREDENTIALS) + ImpersonateLoggedOnUser
+    #    Creates a new LSA logon session that holds the supplied credentials and
+    #    makes the main PowerShell thread use it for all outbound network connections.
+    #    Kerberos TGT requests are satisfied by LSA from this logon session, so
+    #    synchronous operations on the calling thread authenticate correctly even when
+    #    the Secondary Logon service's credential cache is broken by recent Windows
+    #    security updates (KB5034123, KB5034765 and related).
+    #
+    # 2. $psRunAsCredential + $PSDefaultParameterValues['*-AD*:Credential'] + ['*-AD*:Server']
+    #    The AD PowerShell module (Microsoft.ActiveDirectory.Management) uses
+    #    async LDAP/ADWS I/O that runs on .NET thread-pool threads.  Thread-pool
+    #    threads do NOT inherit a Win32 thread impersonation token, so mechanism #1
+    #    alone is insufficient for AD cmdlets.  The credential script (dot-sourced
+    #    so its variables land in the interactive session's scope) creates a
+    #    PSCredential named $psRunAsCredential.  This is registered as the default
+    #    -Credential for all AD cmdlets via $PSDefaultParameterValues, ensuring
+    #    every Get-ADUser / Get-ADGroup / etc. call carries the explicit credential
+    #    regardless of which thread handles I/O.
+    #
+    #    When the credential is in UPN format and -Domain was not explicitly provided,
+    #    the domain portion of the UPN (e.g. ad.ucl.ac.uk from user@ad.ucl.ac.uk) is
+    #    also registered as $PSDefaultParameterValues['*-AD*:Server'].  Without this
+    #    the AD module tries to discover a DC for the local machine's domain rather than
+    #    the target domain, which fails with "Unable to find a default server with
+    #    Active Directory Web Services running" when the machine is not joined to the
+    #    target domain.
+    #
+    # Note: CredWrite(CRED_PERSIST_SESSION) cannot be used here.
+    #    LOGON32_LOGON_NEW_CREDENTIALS (type 9) creates a "NewCredentials" logon
+    #    session — a lightweight overlay designed only for outbound network credential
+    #    substitution.  Windows does NOT associate a credential vault with this session
+    #    LUID, so CredWrite always fails with Win32=1312 (ERROR_NO_SUCH_LOGON_SESSION)
+    #    regardless of when it is called.
+    #
+    # Password transport: a random 256-bit AES key is generated here, used with
+    # ConvertFrom-SecureString -Key to encrypt the password (no DPAPI), and then
+    # the key and encrypted blob are both embedded in the temporary script.
+    # DPAPI (ConvertFrom-SecureString without -Key) cannot be used here because
+    # CreateProcessWithLogonW with LOGON_NETONLY does not load the user profile,
+    # so the DPAPI master keys in AppData\Roaming\Microsoft\Protect are
+    # inaccessible in the spawned process and decryption fails with
+    # "Error occurred during a cryptographic operation."
+    # The temp file is created with no special ACL (inherits TEMP directory
+    # permissions, typically accessible only to the current user on a well-
+    # configured system) and is deleted immediately after the spawned session
+    # reads it.
+    try {
+        # Generate a random 256-bit AES key and encrypt the password with it.
+        $aesKey            = [byte[]]::new(32)
+        $rng               = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+        $rng.GetBytes($aesKey)
+        $rng.Dispose()
+        $encryptedPassword   = ConvertFrom-SecureString $Credential.Password -Key $aesKey
+        $aesKeyB64           = [System.Convert]::ToBase64String($aesKey)
+        # Zero the key bytes now that they have been embedded in the script string.
+        [System.Array]::Clear($aesKey, 0, $aesKey.Length)
+
+        $credUserForScript   = $Credential.UserName.Replace("'", "''")
+        # LogonUser takes the username and domain as separate strings.
+        # For SAM format (DOMAIN\user), $credUser is already the bare username and
+        # $credDomain is the NETBIOS domain name.  For UPN (user@domain.com),
+        # $credDomain is null; LogonUser requires a null (not empty-string) domain in
+        # that case, so embed the PowerShell literal $null rather than ''.
+        $credUserForLogon   = $credUser.Replace("'", "''")
+        $credDomainLogonArg = if ($credDomain) {
+            "'" + $credDomain.Replace("'", "''") + "'"
+        } else {
+            '$null'
+        }
+        # Plain-text version of the domain for embedding in the diagnostic log line.
+        # $credDomainLogonArg includes surrounding single-quote syntax decorations for
+        # NETBIOS names ('CONTOSO'); those quotes would break the single-quoted string
+        # in the generated .Add() call.  This variable holds only the bare value.
+        # '$null' (the literal text with a dollar sign) is used for the UPN/no-domain
+        # case to match the PowerShell $null syntax that is actually passed as the
+        # lpszDomain argument to LogonUser, keeping the diagnostic log consistent with
+        # what was passed to the Win32 API.
+        $credDomainDisplay  = if ($credDomain) { $credDomain.Replace("'", "''") } else { '$null' }
+        # Bake the diagnostic flag into the generated script as a literal so no
+        # parameter passing is needed across the process boundary.
+        $diagEnabledLiteral  = if ($Diagnostic) { '$true' } else { '$false' }
+        $netOnlyCredScript   = Join-Path ([System.IO.Path]::GetTempPath()) `
+                                   ([System.IO.Path]::ChangeExtension(
+                                       [System.IO.Path]::GetRandomFileName(), 'ps1'))
+        # Pre-compute the server auto-inject block for UPN credentials without -Domain.
+        # The block is embedded directly in the credential script (below) rather than
+        # as an extra $setupParts element so that the total lpCommandLine passed to
+        # CreateProcessWithLogonW stays under its documented 1024-character limit.
+        # $credUpnDomain is null for SAM (DOMAIN\user) credentials; the block is
+        # empty in that case and the credential script skips the assignment.
+        $autoServerBlock = if (-not $Domain -and $credUpnDomain) {
+            $s = $credUpnDomain.Replace("'", "''")
+            # *-AD*:Server targets the ADWS endpoint for AD cmdlets (Get-ADUser, etc.).
+            # *-Dns*:ComputerName targets the DNS server for Resolve-DnsName and related
+            # cmdlets — useful when querying SRV/A records for the same domain.
+            "`$PSDefaultParameterValues['*-AD*:Server'] = '$s'`n`$PSDefaultParameterValues['*-Dns*:ComputerName'] = '$s'"
+        } else { '' }
+
+        # NOTE: In this @"..."@ here-string, variables WITHOUT a leading backtick
+        # ($credUserForLogon, $credDomainDisplay, $diagEnabledLiteral, $aesKeyB64,
+        # $encryptedPassword, $credDomainLogonArg, $autoServerBlock) are expanded by
+        # the OUTER script and their values are baked into the generated credential
+        # startup script.
+        # Variables WITH a leading backtick (`$_diag, `$_sec, etc.) are NOT expanded
+        # here; they become literal $-prefixed names in the generated script that run
+        # in the spawned session.
+        @"
+`$_diagEnabled = $diagEnabledLiteral
+`$_diagLog     = `$null
+`$_diag        = [System.Collections.Generic.List[string]]::new()
+if (`$_diagEnabled) {
+    `$_diagLog = [System.IO.Path]::Combine(`$env:TEMP, ('Start-RunAs-diag-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.log'))
+    `$_diag.Add('[' + (Get-Date -Format 'o') + '] Start-RunAs credential startup diagnostic')
+    `$_diag.Add('  start-runas-build : 20260416-fix-netonly-auto-server')
+    `$_diag.Add('  env:USERNAME   = ' + `$env:USERNAME)
+    `$_diag.Add('  env:USERDOMAIN = ' + `$env:USERDOMAIN)
+    `$_id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    `$_diag.Add('  identity (before)             = ' + `$_id.Name)
+    `$_diag.Add('  impersonation level (before)  = ' + `$_id.ImpersonationLevel)
+    `$_id.Dispose()
+    `$_diag.Add('  LogonUser args: username=$credUserForLogon  domain=$credDomainDisplay')
+}
+try {
+    if (-not ('PsRunAsInternal.LogonHelper' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace PsRunAsInternal {
+    public static class LogonHelper {
+        public const int LOGON32_LOGON_NEW_CREDENTIALS = 9;
+        public const int LOGON32_PROVIDER_WINNT50      = 3;
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool LogonUser(
+            string lpszUsername, string lpszDomain, IntPtr lpszPassword,
+            int dwLogonType, int dwLogonProvider, out IntPtr phToken);
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool ImpersonateLoggedOnUser(IntPtr hToken);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool CloseHandle(IntPtr hObject);
+    }
+}
+'@
+    }
+    `$_key = [System.Convert]::FromBase64String('$aesKeyB64')
+    `$_sec = ConvertTo-SecureString '$encryptedPassword' -Key `$_key
+    [System.Array]::Clear(`$_key, 0, `$_key.Length)
+    `$_ptr = [System.Runtime.InteropServices.Marshal]::SecureStringToGlobalAllocUnicode(`$_sec)
+    try {
+        # LogonUser(LOGON32_LOGON_NEW_CREDENTIALS) + ImpersonateLoggedOnUser
+        # Install the domain credential directly into LSA on the main PowerShell
+        # thread.  Kerberos TGT requests are satisfied by the LSA logon session
+        # created here, so AD cmdlets (Get-ADUser, etc.) authenticate correctly even
+        # on systems where the Secondary Logon service's credential cache is broken by
+        # recent Windows security updates.  LOGON32_LOGON_NEW_CREDENTIALS does not
+        # contact the DC at logon time (credentials are validated only on first
+        # outbound use), so the call always succeeds as long as the parameters are
+        # well-formed.  ImpersonateLoggedOnUser applies the new logon session to the
+        # current thread; RevertToSelf is intentionally not called so the session
+        # persists for the lifetime of the interactive shell.
+        `$_logonToken = [IntPtr]::Zero
+        `$_logonOk    = [PsRunAsInternal.LogonHelper]::LogonUser(
+                '$credUserForLogon', $credDomainLogonArg, `$_ptr,
+                [PsRunAsInternal.LogonHelper]::LOGON32_LOGON_NEW_CREDENTIALS,
+                [PsRunAsInternal.LogonHelper]::LOGON32_PROVIDER_WINNT50,
+                [ref]`$_logonToken)
+        `$_w32eLogon = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        if (`$_diagEnabled) {
+            if (`$_logonOk) {
+                `$_diag.Add('  LogonUser: succeeded  token=' + `$_logonToken)
+            } else {
+                `$_diag.Add('  LogonUser: FAILED  Win32=' + `$_w32eLogon + '  ' + ([System.ComponentModel.Win32Exception]::new(`$_w32eLogon)).Message)
+            }
+        }
+        if (`$_logonOk -and `$_logonToken -ne [IntPtr]::Zero) {
+            `$_impersonateOk    = [PsRunAsInternal.LogonHelper]::ImpersonateLoggedOnUser(`$_logonToken)
+            `$_w32eImpersonate  = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            if (`$_diagEnabled) {
+                if (`$_impersonateOk) {
+                    `$_diag.Add('  ImpersonateLoggedOnUser: succeeded')
+                    `$_id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+                    `$_diag.Add('  identity (after)             = ' + `$_id.Name)
+                    `$_diag.Add('  impersonation level (after)  = ' + `$_id.ImpersonationLevel)
+                    `$_id.Dispose()
+                } else {
+                    `$_diag.Add('  ImpersonateLoggedOnUser: FAILED  Win32=' + `$_w32eImpersonate + '  ' + ([System.ComponentModel.Win32Exception]::new(`$_w32eImpersonate)).Message)
+                }
+            }
+            # ImpersonateLoggedOnUser has already duplicated the token internally;
+            # the original handle is no longer needed.
+            [PsRunAsInternal.LogonHelper]::CloseHandle(`$_logonToken) | Out-Null
+        }
+        # Create a PSCredential in the calling (interactive session) scope so that
+        # AD cmdlets can receive the domain credential explicitly via
+        # PSDefaultParameterValues['*-AD*:Credential'].  This is more reliable than
+        # Win32 thread impersonation because the AD module uses async LDAP/ADWS I/O
+        # that runs on thread-pool threads which do NOT inherit the Win32 thread
+        # impersonation token.  `$_sec.Copy() creates an independent SecureString so
+        # the credential remains valid after `$_sec is disposed in the finally block
+        # below.  The variable name has no _ prefix so it is NOT removed by the
+        # Remove-Variable cleanup at the end of this script — it stays in scope for
+        # the lifetime of the interactive session.
+        # NOTE: this script must be dot-sourced (.) not called (&) for this variable
+        # to land in the interactive session's scope.
+        `$psRunAsCredential = New-Object System.Management.Automation.PSCredential(
+            '$credUserForScript', `$_sec.Copy())
+        if (`$_diagEnabled) {
+            `$_diag.Add('  psRunAsCredential: created for ' + `$psRunAsCredential.UserName)
+        }
+    } finally {
+        [System.Runtime.InteropServices.Marshal]::ZeroFreeGlobalAllocUnicode(`$_ptr)
+        `$_sec.Dispose()
+        # Explicitly clear security-sensitive variables holding crypto/handle data.
+        Remove-Variable -Name '_ptr','_sec','_key','_logonToken' -ErrorAction SilentlyContinue
+    }
+} catch {
+    if (`$_diagEnabled) {
+        `$_ex = `$_.Exception
+        while (`$_ex) {
+            `$_diag.Add('  EXCEPTION: [' + `$_ex.GetType().FullName + '] ' + `$_ex.Message)
+            `$_ex = `$_ex.InnerException
+        }
+    }
+} finally {
+    if (`$_diagEnabled -and `$_diagLog) {
+        `$_diag | Set-Content -LiteralPath `$_diagLog -Encoding UTF8
+        Write-Host ('[Start-RunAs] Credential startup log: ' + `$_diagLog) -ForegroundColor Yellow
+        # Expose the log path in a session-scoped variable (no _ prefix, so it is NOT
+        # removed by the cleanup below) so that the post-setup diagnostic step in this
+        # script can append the final PSDefaultParameterValues state.
+        `$psRunAsDiagLog = `$_diagLog
+    }
+    # Clean up all script-private variables (all use the _ prefix).
+    Get-Variable -Name '_*' -Scope Local -ErrorAction SilentlyContinue | Remove-Variable -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath `$PSCommandPath -Force -ErrorAction SilentlyContinue
+}
+# Configure PSDefaultParameterValues with the domain credential and target server.
+# These run after the try/catch/finally block so that `$psRunAsCredential and
+# `$psRunAsDiagLog are already set.  Get-Variable with -ErrorAction SilentlyContinue
+# avoids breaking sessions where Set-StrictMode -Version Latest is active and the
+# credential script failed (leaving `$psRunAsCredential unset).
+if (Get-Variable -Name 'psRunAsCredential' -ValueOnly -ErrorAction SilentlyContinue) {
+    `$PSDefaultParameterValues['*-AD*:Credential'] = `$psRunAsCredential
+}
+$autoServerBlock
+# Post-setup diagnostic: print AD config to the spawned console and append to log.
+# The if-guard is a no-op when -Diagnostic was not specified (psRunAsDiagLog is not set).
+if (Get-Variable -Name 'psRunAsDiagLog' -ValueOnly -ErrorAction SilentlyContinue) {
+    `$__s  = `$PSDefaultParameterValues['*-AD*:Server']
+    `$__c  = `$PSDefaultParameterValues['*-AD*:Credential']
+    `$__sv = if (`$__s) { `$__s } else { '(not set)' }
+    `$__cv = if (`$__c) { '<PSCredential:' + `$__c.UserName + '>' } else { '(not set)' }
+    Write-Host ('[Start-RunAs][post-setup] *-AD*:Server     = ' + `$__sv) -ForegroundColor Yellow
+    Write-Host ('[Start-RunAs][post-setup] *-AD*:Credential = ' + `$__cv) -ForegroundColor Yellow
+    try {
+        Add-Content -LiteralPath `$psRunAsDiagLog -Encoding UTF8 -Value @(
+            '  [post-setup] PSDefaultParameterValues[*-AD*:Server]     = ' + `$__sv,
+            '  [post-setup] PSDefaultParameterValues[*-AD*:Credential] = ' + `$__cv)
+    } catch {
+        Write-Warning ('[Start-RunAs] Could not append post-setup state to log: ' + `$_.Exception.Message)
+    }
+    Remove-Variable -Name '__s','__c','__sv','__cv' -ErrorAction SilentlyContinue
+}
+"@ | Set-Content -LiteralPath $netOnlyCredScript -Encoding UTF8
+        $netOnlyCredScriptEscaped = $netOnlyCredScript.Replace("'", "''")
+        # Dot-source (.) rather than call (&) so that $psRunAsCredential,
+        # $PSDefaultParameterValues, and any other variables created inside the
+        # script are placed in the interactive session's scope and persist for
+        # the lifetime of the shell.  All setup (credential binding, AD server
+        # defaults, post-setup diagnostic output) is embedded in the script so
+        # that $cmdLine stays well under CreateProcessWithLogonW's 1024-char limit.
+        $setupParts.Insert(0, ". '$netOnlyCredScriptEscaped'")
+    } catch {
+        Write-Warning ("Could not prepare credential registration script for the spawned " +
+                       "session: $($_.Exception.Message). Network authentication (LDAP, " +
+                       "AD queries) may fail on systems with recent Windows security " +
+                       "updates that changed Secondary Logon service credential handling.")
+    }
+}
+
 $setupLine = $setupParts -join '; '
 
 if ($setupLine) {
@@ -550,27 +895,9 @@ namespace PsRunAsInternal {
 '@
     }
 
-    # Split the credential username into the parts expected by
-    # CreateProcessWithLogonW.  For UPN format (user@domain) pass the full
-    # UPN as lpUsername with a null lpDomain, as documented by the API.
-    # For DOMAIN\user format split into the two components.
-    $credUser   = $Credential.UserName
-    $credDomain = $null
-    if ($credUser -match '^([^\\]+)\\(.+)$') {
-        $credDomain = $Matches[1]
-        $credUser   = $Matches[2]
-    }
-
-    # Derive the Windows Credential Manager target for the domain.
-    # For DOMAIN\user the target is the NETBIOS domain name; for UPN the
-    # target is the DNS domain portion (everything after the '@').
-    $credMgrTarget = if ($credDomain) {
-        $credDomain
-    } elseif ($credUser -match '@(.+)$') {
-        $Matches[1]
-    } else {
-        $credUser
-    }
+    # $credUser, $credDomain, and $credMgrTarget were derived before $setupParts
+    # was built so the values are shared with the spawned-session credential
+    # registration script injected into $setupParts above.
 
     # Build a properly-quoted command line string for lpCommandLine.
     $quotedExe = '"' + $psExe.Replace('"', '""') + '"'
@@ -704,18 +1031,21 @@ namespace PsRunAsInternal {
         # be an MSIX-packaged application that was not caught by the earlier detection
         # step (e.g. the OS reported a virtualized image path).  Retry with the known
         # non-MSIX PowerShell executables before surfacing the error to the user.
-        # Check via the Win32 error code first (locale-independent), then fall back
-        # to a message-string match for robustness across PowerShell versions.
         # Recent Windows security updates can also cause Start-Process -Credential to
-        # throw System.Security.Authentication.AuthenticationException ("Authentication
-        # failed, see inner exception.") instead of Win32Exception 1326 for the same
-        # MSIX-related failure; include that exception type in the logon-failure check
-        # so the retry logic fires rather than immediately surfacing the error.
-        $win32Ex = $_.Exception.InnerException -as [System.ComponentModel.Win32Exception]
-        $isLogonFailure = ($win32Ex -and $win32Ex.NativeErrorCode -eq 1326) -or
-                          ($_.Exception.Message -like '*user name or password*') -or
-                          ($_.Exception     -is [System.Security.Authentication.AuthenticationException]) -or
-                          ($_.Exception.InnerException -is [System.Security.Authentication.AuthenticationException])
+        # throw System.InvalidOperationException ("Authentication failed, see inner
+        # exception.") — the outer exception is NOT typed as AuthenticationException;
+        # the type check alone is therefore insufficient.  Walk the entire InnerException
+        # chain and match on both the type and the message.
+        $isLogonFailure = $false
+        $searchEx = $_.Exception
+        while ($searchEx -and -not $isLogonFailure) {
+            $win32Ex = $searchEx -as [System.ComponentModel.Win32Exception]
+            $isLogonFailure = ($win32Ex -and $win32Ex.NativeErrorCode -eq 1326) -or
+                              ($searchEx.Message -like '*user name or password*') -or
+                              ($searchEx.Message -like '*Authentication failed*') -or
+                              ($searchEx -is [System.Security.Authentication.AuthenticationException])
+            $searchEx = $searchEx.InnerException
+        }
 
         if (-not $isLogonFailure) { throw }
 
@@ -740,15 +1070,21 @@ namespace PsRunAsInternal {
                 $launched = $true
                 break
             } catch {
-                # Only suppress logon-failure errors (Win32 1326 or AuthenticationException),
-                # which may indicate that this candidate is also MSIX-packaged.  Any other
-                # error is real (e.g. wrong credentials, logon type not permitted) and should
-                # be surfaced immediately rather than silently discarded.
-                $retryWin32Ex = $_.Exception.InnerException -as [System.ComponentModel.Win32Exception]
-                $isRetryLogonFailure = ($retryWin32Ex -and $retryWin32Ex.NativeErrorCode -eq 1326) -or
-                                       ($_.Exception.Message -like '*user name or password*') -or
-                                       ($_.Exception     -is [System.Security.Authentication.AuthenticationException]) -or
-                                       ($_.Exception.InnerException -is [System.Security.Authentication.AuthenticationException])
+                # Only suppress logon-failure errors (Win32 1326, "Authentication failed"
+                # message, or AuthenticationException at any nesting depth), which may
+                # indicate that this candidate is also MSIX-packaged.  Any other error is
+                # real (e.g. wrong credentials, logon type not permitted) and should be
+                # surfaced immediately rather than silently discarded.
+                $isRetryLogonFailure = $false
+                $searchEx = $_.Exception
+                while ($searchEx -and -not $isRetryLogonFailure) {
+                    $retryWin32Ex = $searchEx -as [System.ComponentModel.Win32Exception]
+                    $isRetryLogonFailure = ($retryWin32Ex -and $retryWin32Ex.NativeErrorCode -eq 1326) -or
+                                           ($searchEx.Message -like '*user name or password*') -or
+                                           ($searchEx.Message -like '*Authentication failed*') -or
+                                           ($searchEx -is [System.Security.Authentication.AuthenticationException])
+                    $searchEx = $searchEx.InnerException
+                }
                 if (-not $isRetryLogonFailure) { throw }
                 $lastCaughtError = $_
                 # Logon failure on this candidate; try the next one.
@@ -760,7 +1096,15 @@ namespace PsRunAsInternal {
             # Surface the underlying Win32 error so the user can diagnose the real
             # cause (e.g. wrong password, account locked, domain unreachable, missing
             # interactive logon right) rather than seeing only the generic message.
-            $lcWin32 = $lastCaughtError.Exception.InnerException -as [System.ComponentModel.Win32Exception]
+            # Walk the full exception chain and keep the deepest Win32Exception found,
+            # as the innermost one typically carries the most specific error code.
+            $lcWin32 = $null
+            $searchEx = $lastCaughtError.Exception
+            while ($searchEx) {
+                $candidate = $searchEx -as [System.ComponentModel.Win32Exception]
+                if ($candidate) { $lcWin32 = $candidate }
+                $searchEx = $searchEx.InnerException
+            }
             $errDetail = if ($lcWin32) {
                 " The underlying error was: $($lcWin32.Message) (Win32 error $($lcWin32.NativeErrorCode))."
             } else {
