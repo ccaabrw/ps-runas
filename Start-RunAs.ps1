@@ -749,7 +749,7 @@ namespace PsRunAsInternal {
             "-Value @('  [post-setup] PSDefaultParameterValues[*-AD*:Server]     = ' + `$__sv, " +
             "         '  [post-setup] PSDefaultParameterValues[*-AD*:Credential] = ' + `$__cv) } " +
             "catch { Write-Warning ('[Start-RunAs] Could not append post-setup state to log: ' + `$_.Exception.Message) }; " +
-            "Remove-Variable -Name '__s','__c','__sv','__cv' -ErrorAction SilentlyContinue }"
+            "Remove-Variable -Name '__s','__c','__sv','__cv' -ErrorAction SilentlyContinue }" # matches $__s, $__c, $__sv, $__cv above
         )
     } catch {
         Write-Warning ("Could not prepare credential registration script for the spawned " +
