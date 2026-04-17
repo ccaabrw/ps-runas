@@ -64,7 +64,14 @@ foreach ($credentialFile in $credentialFiles) {
     catch {
         throw "Unable to read credential file '$($credentialFile.FullName)': $($_.Exception.Message)"
     }
+
+    if (($credData.PSObject.Properties.Name -notcontains 'UserName') -or
+        [string]::IsNullOrWhiteSpace([string]$credData.UserName)) {
+        throw "Credential file '$($credentialFile.FullName)' is missing required field 'UserName'."
+    }
+
     $userName = [string]$credData.UserName
+    $savedAt = if ($credData.PSObject.Properties.Name -contains 'SavedAt') { $credData.SavedAt } else { $null }
     $user = $null
     $domain = $null
 
@@ -83,7 +90,7 @@ foreach ($credentialFile in $credentialFiles) {
         UserName = $userName
         User     = $user
         Domain   = $domain
-        SavedAt  = $credData.SavedAt
+        SavedAt  = $savedAt
         Path     = $credentialFile.FullName
     }
 }
