@@ -31,6 +31,7 @@ ps-runas/
 ├── Start-RunAs.ps1                  # Main script — start a session as a different user
 ├── Save-Credential.ps1              # Save a credential to disk (DPAPI-encrypted SecureString)
 ├── Get-SavedCredential.ps1          # Retrieve a previously saved credential
+├── Get-SavedCredentialList.ps1      # List saved credentials (simple or detailed output)
 ├── Remove-SavedCredential.ps1       # Delete a saved credential from disk
 └── examples/
     └── Invoke-ADManagement.ps1      # Example: AD management session
@@ -218,6 +219,27 @@ Remove-SavedCredential -Name "CONTOSO-Admin"
 # Preview without deleting
 Remove-SavedCredential -Name "CONTOSO-Admin" -WhatIf
 ```
+
+### List saved credentials
+
+```powershell
+Get-SavedCredentialList
+```
+
+Returns a simple list of saved credential names.
+
+```powershell
+Get-SavedCredentialList -Detailed
+```
+
+Returns detailed output per credential with:
+
+- `Name`
+- `UserName`
+- `User`
+- `Domain`
+- `SavedAt`
+- `Path`
 
 ### Credential store parameters
 
