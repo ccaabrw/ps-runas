@@ -11,6 +11,7 @@
         'Start-RunAs',
         'Save-Credential',
         'Get-SavedCredential',
+        'Get-SavedCredentialList',
         'Remove-SavedCredential'
     )
     CmdletsToExport   = @()

@@ -110,6 +110,19 @@ function Get-SavedCredential {
     Invoke-PsRunAsScript -ScriptName 'Get-SavedCredential.ps1' -BoundParameters $PSBoundParameters
 }
 
+function Get-SavedCredentialList {
+    [CmdletBinding()]
+    param (
+        [Parameter()]
+        [string] $StorePath = (Join-Path $env:APPDATA 'ps-cred'),
+
+        [Parameter()]
+        [switch] $Detailed
+    )
+
+    Invoke-PsRunAsScript -ScriptName 'Get-SavedCredentialList.ps1' -BoundParameters $PSBoundParameters
+}
+
 function Remove-SavedCredential {
     [CmdletBinding(SupportsShouldProcess)]
     param (
@@ -124,4 +137,4 @@ function Remove-SavedCredential {
     Invoke-PsRunAsScript -ScriptName 'Remove-SavedCredential.ps1' -BoundParameters $PSBoundParameters
 }
 
-Export-ModuleMember -Function Start-RunAs, Save-Credential, Get-SavedCredential, Remove-SavedCredential
+Export-ModuleMember -Function Start-RunAs, Save-Credential, Get-SavedCredential, Get-SavedCredentialList, Remove-SavedCredential
