@@ -67,7 +67,7 @@ foreach ($credentialFile in $credentialFiles) {
 
     if (($credData.PSObject.Properties.Name -notcontains 'UserName') -or
         [string]::IsNullOrWhiteSpace([string]$credData.UserName)) {
-        throw "Credential file '$($credentialFile.FullName)' is missing required field 'UserName'."
+        throw "Credential file '$($credentialFile.FullName)' has a missing or invalid 'UserName' field."
     }
 
     $userName = [string]$credData.UserName
