@@ -10,8 +10,8 @@
 
     Steps performed:
       1.  Prompt for domain admin credentials.
-      2.  Open a new Windows Terminal / PowerShell window running under those
-          credentials via Start-RunAs.ps1.
+      2.  Import the PsRunAs module and open a new Windows Terminal / PowerShell
+          window running under those credentials via Start-RunAs.
       3.  Inside the elevated session, import the RSAT Active Directory module
           and run a handful of illustrative AD queries / changes.
 
@@ -28,7 +28,7 @@
     queries).  Defaults to the domain of the current machine.
 
 .PARAMETER NetOnly
-    Passes the -NetOnly switch through to Start-RunAs.ps1, which causes
+    Passes the -NetOnly switch through to Start-RunAs, which causes
     the new PowerShell window to run locally under your own account while
     routing all network access (LDAP, UNC paths, etc.) through the specified
     domain admin credentials.
@@ -61,8 +61,8 @@
         Services Tools must be installed on the workstation.
         Install with:
             Add-WindowsCapability -Online -Name Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0
-      • The Start-RunAs.ps1 script must exist in the parent directory
-        (..\ relative to this file).
+      • The PsRunAs module must exist in the parent directory
+        (..\PsRunAs.psd1 relative to this file).
       • -NetOnly does not require the target account to have interactive logon
         rights on this machine; it is equivalent to "runas /netonly".
 #>
@@ -89,10 +89,17 @@ $credential = Get-Credential -UserName $DomainAdmin `
 
 #endregion
 
+#region --- Import module ------------------------------------------------------
+
+$modulePath = Join-Path $PSScriptRoot '..\PsRunAs.psd1'
+Import-Module -Name $modulePath -Force
+
+#endregion
+
 #region --- AD commands to run in the new session ----------------------------
 
 # Everything in this here-string will be executed inside the privileged
-# PowerShell window that Start-RunAs.ps1 opens.  Edit freely.
+# PowerShell window that Start-RunAs opens.  Edit freely.
 $adScript = @"
 # ── Active Directory Management Session ─────────────────────────────────────
 # Running as: $($credential.UserName)
@@ -141,12 +148,6 @@ Write-Host 'AD management session ready.  Type your AD commands below.' -Foregro
 
 #region --- Launch privileged Windows Terminal session -----------------------
 
-$startRunAs = Join-Path $PSScriptRoot '..\Start-RunAs.ps1'
-
-if (-not (Test-Path -LiteralPath $startRunAs)) {
-    throw "Cannot find Start-RunAs.ps1 at expected path: $startRunAs"
-}
-
 # Write the AD script to a temporary file so it can be passed as -File to
 # the inner PowerShell session (avoids quoting headaches on the command line).
 $tempScript = [System.IO.Path]::GetTempFileName() -replace '\.tmp$', '.ps1'
@@ -158,9 +159,9 @@ try {
     Write-Host "Opening Windows Terminal as '$DomainAdmin' for AD management$netOnlySuffix..." `
                -ForegroundColor Cyan
 
-    & $startRunAs `
-        -Credential      $credential `
-        -ArgumentList    @('-File', $tempScript) `
+    Start-RunAs `
+        -Credential   $credential `
+        -ArgumentList @('-File', $tempScript) `
         -NetOnly:$NetOnly `
         -Verbose:($VerbosePreference -eq 'Continue')
 }

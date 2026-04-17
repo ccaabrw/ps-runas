@@ -26,6 +26,8 @@ When you need to perform tasks (e.g. Active Directory management) that require a
 
 ```
 ps-runas/
+├── PsRunAs.psd1                    # Module manifest
+├── PsRunAs.psm1                    # Module exports: Start-RunAs and credential cmdlets
 ├── Start-RunAs.ps1                  # Main script — start a session as a different user
 ├── Save-Credential.ps1              # Save a credential to disk (DPAPI-encrypted SecureString)
 ├── Get-SavedCredential.ps1          # Retrieve a previously saved credential
@@ -38,10 +40,16 @@ ps-runas/
 
 ## Usage
 
+Import the module first:
+
+```powershell
+Import-Module .\PsRunAs.psd1
+```
+
 ### Basic — prompt for credentials
 
 ```powershell
-.\Start-RunAs.ps1 -UserName "CONTOSO\AdminUser"
+Start-RunAs -UserName "CONTOSO\AdminUser"
 ```
 
 You will be prompted for the password.  A new PowerShell console window opens running as `CONTOSO\AdminUser`.
@@ -50,19 +58,19 @@ You will be prompted for the password.  A new PowerShell console window opens ru
 
 ```powershell
 $cred = Get-Credential -UserName "CONTOSO\AdminUser" -Message "Enter admin credentials"
-.\Start-RunAs.ps1 -Credential $cred
+Start-RunAs -Credential $cred
 ```
 
 ### Start in a specific directory
 
 ```powershell
-.\Start-RunAs.ps1 -UserName "CONTOSO\AdminUser" -WorkingDirectory "C:\AdminTools"
+Start-RunAs -UserName "CONTOSO\AdminUser" -WorkingDirectory "C:\AdminTools"
 ```
 
 ### Use NetOnly when the account lacks interactive logon rights
 
 ```powershell
-.\Start-RunAs.ps1 -UserName "jdoe@contoso.com" -NetOnly
+Start-RunAs -UserName "jdoe@contoso.com" -NetOnly
 ```
 
 The new window runs locally as your own account but all network access (Active Directory,
@@ -71,7 +79,7 @@ UNC paths, etc.) uses the specified credentials — identical to `runas /netonly
 ### Set the window title to show the domain and user
 
 ```powershell
-.\Start-RunAs.ps1 -UserName "CONTOSO\AdminUser" -WindowTitle "CONTOSO\AdminUser"
+Start-RunAs -UserName "CONTOSO\AdminUser" -WindowTitle "CONTOSO\AdminUser"
 ```
 
 The title bar of the new PowerShell window will read `CONTOSO\AdminUser`, making it easy to
@@ -80,7 +88,7 @@ identify which account each window is running under when you have multiple sessi
 ### Pre-configure Active Directory cmdlets to target a specific domain
 
 ```powershell
-.\Start-RunAs.ps1 -UserName "CONTOSO\AdminUser" -Domain "contoso.com"
+Start-RunAs -UserName "CONTOSO\AdminUser" -Domain "contoso.com"
 ```
 
 Opens a PowerShell console window running as `CONTOSO\AdminUser` with both
@@ -96,7 +104,7 @@ interactive logon instead.
 ### Record a transcript of the session
 
 ```powershell
-.\Start-RunAs.ps1 -UserName "CONTOSO\AdminUser" -TranscriptPath "C:\Logs\admin-session.log"
+Start-RunAs -UserName "CONTOSO\AdminUser" -TranscriptPath "C:\Logs\admin-session.log"
 ```
 
 Opens a PowerShell console window running as `CONTOSO\AdminUser` and automatically starts recording
@@ -106,7 +114,7 @@ transcript is appended to it.
 
 ```powershell
 # Combine with other options — record a coloured, titled, NetOnly session
-.\Start-RunAs.ps1 -UserName "CONTOSO\AdminUser" -NetOnly `
+Start-RunAs -UserName "CONTOSO\AdminUser" -NetOnly `
     -WindowTitle "CONTOSO\AdminUser" -BackgroundColor DarkBlue -ForegroundColor White `
     -TranscriptPath "C:\Logs\admin-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
 ```
@@ -179,7 +187,7 @@ The three credential scripts let you save and reuse credentials without being pr
 ### Save a credential
 
 ```powershell
-.\Save-Credential.ps1 -Name "CONTOSO-Admin" -UserName "CONTOSO\AdminUser"
+Save-Credential -Name "CONTOSO-Admin" -UserName "CONTOSO\AdminUser"
 ```
 
 You are prompted for the password once.  The credential is written to  
@@ -189,26 +197,26 @@ Data Protection API (DPAPI) — only the same Windows user on the same machine c
 ```powershell
 # Save a pre-built credential without a second prompt
 $cred = Get-Credential -UserName "CONTOSO\AdminUser" -Message "Enter admin credentials"
-.\Save-Credential.ps1 -Name "CONTOSO-Admin" -Credential $cred
+Save-Credential -Name "CONTOSO-Admin" -Credential $cred
 ```
 
 ### Retrieve a saved credential
 
 ```powershell
-$cred = .\Get-SavedCredential.ps1 -Name "CONTOSO-Admin"
-.\Start-RunAs.ps1 -Credential $cred
+$cred = Get-SavedCredential -Name "CONTOSO-Admin"
+Start-RunAs -Credential $cred
 ```
 
-`Get-SavedCredential.ps1` decrypts the stored password and returns a `PSCredential` object  
-that can be passed directly to `Start-RunAs.ps1` or any other cmdlet that accepts `-Credential`.
+`Get-SavedCredential` decrypts the stored password and returns a `PSCredential` object  
+that can be passed directly to `Start-RunAs` or any other cmdlet that accepts `-Credential`.
 
 ### Remove a saved credential
 
 ```powershell
-.\Remove-SavedCredential.ps1 -Name "CONTOSO-Admin"
+Remove-SavedCredential -Name "CONTOSO-Admin"
 
 # Preview without deleting
-.\Remove-SavedCredential.ps1 -Name "CONTOSO-Admin" -WhatIf
+Remove-SavedCredential -Name "CONTOSO-Admin" -WhatIf
 ```
 
 ### Credential store parameters
