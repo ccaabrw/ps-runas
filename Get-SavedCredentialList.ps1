@@ -58,13 +58,18 @@ foreach ($credentialFile in $credentialFiles) {
         continue
     }
 
-    $credData = Get-Content -LiteralPath $credentialFile.FullName -Raw | ConvertFrom-Json
+    try {
+        $credData = Get-Content -LiteralPath $credentialFile.FullName -Raw | ConvertFrom-Json
+    }
+    catch {
+        throw "Unable to read credential file '$($credentialFile.FullName)': $($_.Exception.Message)"
+    }
     $userName = [string]$credData.UserName
     $user = $null
     $domain = $null
 
-    if ($userName -match '\\') {
-        $domain, $user = $userName.Split('\\', 2)
+    if ($userName.Contains('\')) {
+        $domain, $user = $userName -split '\\+', 2
     }
     elseif ($userName -match '@') {
         $user, $domain = $userName.Split('@', 2)

@@ -232,7 +232,7 @@ Returns a simple list of saved credential names.
 Get-SavedCredentialList -Detailed
 ```
 
-Returns verbose output per credential with:
+Returns detailed output per credential with:
 
 - `Name`
 - `UserName`
