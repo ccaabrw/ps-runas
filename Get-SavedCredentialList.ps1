@@ -71,7 +71,7 @@ foreach ($credentialFile in $credentialFiles) {
     if ($userName.Contains('\')) {
         $separatorIndex = $userName.IndexOf('\')
         $domain = $userName.Substring(0, $separatorIndex)
-        $user = $userName.Substring($separatorIndex + 1).TrimStart('\')
+        $user = $userName.Substring($separatorIndex + 1)
     }
     elseif ($userName -match '@') {
         $user, $domain = $userName.Split('@', 2)
