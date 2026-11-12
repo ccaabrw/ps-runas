@@ -372,9 +372,9 @@ $msixRoots = @(
 )
 
 if ($currentProcessIsPackaged -or ($msixRoots | Where-Object { $psExe -like "$_\*" })) {
-    Write-Warning ("The running PowerShell host ('{0}') is an MSIX-packaged application " +
-                   "and cannot be started as a different user. Searching for a " +
-                   "traditionally-installed PowerShell executable...") -f $psExe
+    Write-Warning (("The running PowerShell host ('{0}') is an MSIX-packaged application " +
+                    "and cannot be started as a different user. Searching for a " +
+                    "traditionally-installed PowerShell executable...") -f $psExe)
 
     $candidateExes = @(
         # PowerShell 7+ MSI install (default path used by all 7.x releases)
